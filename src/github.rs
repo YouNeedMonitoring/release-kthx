@@ -24,10 +24,29 @@ fn run_gh(path: &Path, token_env: &str, args: &[&str]) -> Result<String> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("gh {:?} failed: {}", args, stderr.trim());
+        bail!("{}", format_gh_error(args, stderr.trim()));
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn format_gh_error(args: &[&str], stderr: &str) -> String {
+    if stderr.contains("GitHub Actions is not permitted to create or approve pull requests")
+        || stderr.contains("createPullRequest")
+    {
+        return format!(
+            "Cannot create release PR from this workflow run. GitHub is blocking pull request creation for this token.\n\n\
+             What to do:\n\
+             1) In repository settings, set Actions -> General -> Workflow permissions to 'Read and write permissions'.\n\
+             2) In repository settings, enable 'Allow GitHub Actions to create and approve pull requests'.\n\
+             3) Keep workflow job permissions including `pull-requests: write` and `contents: write`.\n\n\
+             Original gh args: {:?}\n\
+             Original error: {}",
+            args, stderr
+        );
+    }
+
+    format!("gh {:?} failed: {}", args, stderr)
 }
 
 fn run_gh_optional(path: &Path, token_env: &str, args: &[&str]) -> Result<Option<String>> {
