@@ -1,0 +1,66 @@
+name: self-release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      from_tag:
+        description: Optional base tag for release range
+        required: false
+        type: string
+      dry_run:
+        description: Run release without creating a tag
+        required: true
+        default: true
+        type: boolean
+      push_tag:
+        description: Push created tag to origin (ignored when dry_run=true)
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  verify:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate release-kthx config
+        uses: ./.
+        with:
+          mode: check
+          path: .
+
+      - name: Plan release for this repo
+        uses: ./.
+        with:
+          mode: plan
+          path: .
+
+  release:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Release this repository
+        uses: ./.
+        with:
+          mode: release
+          path: .
+          from-tag: ${{ inputs.from_tag }}
+          dry-run: ${{ inputs.dry_run }}
+          push: ${{ inputs.push_tag }}

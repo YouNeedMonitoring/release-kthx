@@ -1,0 +1,7 @@
+[release]
+tag_template = "release-kthx-v{{ version }}"
+
+[github]
+create_release = true
+token_env = "GITHUB_TOKEN"
+repository_env = "GITHUB_REPOSITORY"

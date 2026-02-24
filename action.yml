@@ -1,0 +1,36 @@
+name: release-kthx
+description: Private-repo-first release automation for Rust projects
+author: release-kthx
+
+inputs:
+  mode:
+    description: "Command to execute: init | check | plan | release"
+    required: false
+    default: plan
+  path:
+    description: "Repository path to operate on"
+    required: false
+    default: .
+  from-tag:
+    description: "Optional base tag for commit range"
+    required: false
+  dry-run:
+    description: "When mode=release, do not create a git tag"
+    required: false
+    default: "true"
+  push:
+    description: "When mode=release and dry-run=false, push created tag to origin"
+    required: false
+    default: "false"
+  force:
+    description: "When mode=init, overwrite existing release-kthx.toml"
+    required: false
+    default: "false"
+
+runs:
+  using: docker
+  image: Dockerfile
+
+branding:
+  icon: upload-cloud
+  color: gray-dark
