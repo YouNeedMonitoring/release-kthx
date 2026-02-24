@@ -10,6 +10,32 @@ dry_run="${INPUT_DRY_RUN:-true}"
 push="${INPUT_PUSH:-false}"
 force="${INPUT_FORCE:-false}"
 
+configure_safe_directory() {
+  local repo_path="$1"
+  local abs_path
+
+  if [[ "$repo_path" = /* ]]; then
+    abs_path="$repo_path"
+  else
+    abs_path="$(pwd)/$repo_path"
+  fi
+
+  if command -v realpath >/dev/null 2>&1; then
+    abs_path="$(realpath -m "$abs_path")"
+  fi
+
+  export HOME="${HOME:-/github/home}"
+  mkdir -p "$HOME"
+
+  git config --global --add safe.directory "$abs_path"
+
+  if [[ -d /github/workspace ]]; then
+    git config --global --add safe.directory /github/workspace
+  fi
+}
+
+configure_safe_directory "$path"
+
 case "$mode" in
   init)
     args=(init --path "$path")
