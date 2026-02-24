@@ -4,6 +4,8 @@ set -euo pipefail
 mode="${INPUT_MODE:-plan}"
 path="${INPUT_PATH:-.}"
 from_tag="${INPUT_FROM_TAG:-}"
+base_branch="${INPUT_BASE_BRANCH:-main}"
+pr_branch="${INPUT_PR_BRANCH:-release-kthx/release-pr}"
 dry_run="${INPUT_DRY_RUN:-true}"
 push="${INPUT_PUSH:-false}"
 force="${INPUT_FORCE:-false}"
@@ -24,6 +26,12 @@ case "$mode" in
       args+=(--from-tag "$from_tag")
     fi
     ;;
+  release-pr)
+    args=(release-pr --path "$path" --base-branch "$base_branch" --pr-branch "$pr_branch")
+    if [[ -n "$from_tag" ]]; then
+      args+=(--from-tag "$from_tag")
+    fi
+    ;;
   release)
     args=(release --path "$path")
     if [[ -n "$from_tag" ]]; then
@@ -36,9 +44,18 @@ case "$mode" in
       args+=(--push)
     fi
     ;;
+  publish)
+    args=(publish --path "$path")
+    if [[ "$dry_run" == "true" ]]; then
+      args+=(--dry-run)
+    fi
+    if [[ "$push" == "true" ]]; then
+      args+=(--push)
+    fi
+    ;;
   *)
     echo "unsupported mode: $mode" >&2
-    echo "valid modes: init | check | plan | release" >&2
+    echo "valid modes: init | check | plan | release-pr | release | publish" >&2
     exit 2
     ;;
 esac

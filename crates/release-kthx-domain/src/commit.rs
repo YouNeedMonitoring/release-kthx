@@ -53,9 +53,8 @@ impl PlannedCommit {
             match kind {
                 CommitKind::Feature => super::BumpLevel::Minor,
                 CommitKind::Fix | CommitKind::Refactor => super::BumpLevel::Patch,
-                CommitKind::Documentation | CommitKind::Chore | CommitKind::Other => {
-                    super::BumpLevel::None
-                }
+                CommitKind::Other => super::BumpLevel::Patch,
+                CommitKind::Documentation | CommitKind::Chore => super::BumpLevel::None,
             }
         };
 
@@ -112,5 +111,15 @@ mod tests {
         });
         assert!(planned.breaking);
         assert_eq!(bump, super::super::BumpLevel::Major);
+    }
+
+    #[test]
+    fn non_conventional_subject_defaults_to_patch() {
+        let (_, bump) = PlannedCommit::from_input(CommitInput {
+            hash: "a".to_string(),
+            subject: "update release process".to_string(),
+            body: String::new(),
+        });
+        assert_eq!(bump, super::super::BumpLevel::Patch);
     }
 }

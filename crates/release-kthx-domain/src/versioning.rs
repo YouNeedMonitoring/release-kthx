@@ -59,7 +59,7 @@ pub fn plan_release(
     }
 
     if bump == BumpLevel::None {
-        bump = BumpLevel::Patch;
+        return None;
     }
 
     let next_version = bump.apply(&current_version);
@@ -92,5 +92,19 @@ mod tests {
 
         assert_eq!(plan.bump_level, BumpLevel::Minor);
         assert_eq!(plan.next_version.to_string(), "1.3.0");
+    }
+
+    #[test]
+    fn returns_none_for_docs_only() {
+        let plan = plan_release(
+            Version::parse("1.2.3").expect("valid semver"),
+            None,
+            vec![CommitInput {
+                hash: "abc".to_string(),
+                subject: "docs: clarify release flow".to_string(),
+                body: String::new(),
+            }],
+        );
+        assert!(plan.is_none());
     }
 }

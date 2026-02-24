@@ -29,11 +29,29 @@ pub enum Command {
         #[arg(long)]
         from_tag: Option<String>,
     },
+    ReleasePr {
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        #[arg(long)]
+        from_tag: Option<String>,
+        #[arg(long, default_value = "main")]
+        base_branch: String,
+        #[arg(long, default_value = "release-kthx/release-pr")]
+        pr_branch: String,
+    },
     Release {
         #[arg(long, default_value = ".")]
         path: PathBuf,
         #[arg(long)]
         from_tag: Option<String>,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        #[arg(long, default_value_t = false)]
+        push: bool,
+    },
+    Publish {
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
         #[arg(long, default_value_t = false)]
         dry_run: bool,
         #[arg(long, default_value_t = false)]

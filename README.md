@@ -9,12 +9,12 @@ It ships first as a GitHub Action (Docker action), with a Rust CLI runtime insid
 - No crates.io dependency in the default flow
 - Conventional-commit based version planning from git history
 - Works with org-private repos and custom GitHub tokens in CI
-- Generates changelog text and creates annotated git tags for releases
+- PR-first release flow: open release PR with version bumps, publish after merge
 
 ## GitHub Action usage
 
 ```yaml
-name: release
+name: release-pr-and-publish
 
 on:
   workflow_dispatch:
@@ -22,7 +22,7 @@ on:
     branches: [main]
 
 jobs:
-  release-kthx:
+  release_pr:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -33,16 +33,32 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Plan release
+      - name: Create or update release PR
         uses: ./. # replace with your published action ref
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         with:
-          mode: plan
+          mode: release-pr
           path: .
 
-      - name: Create tag (example)
-        uses: ./. # replace with your published action ref
+  publish:
+    needs: [release_pr]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          mode: release
+          fetch-depth: 0
+
+      - name: Publish merged release
+        uses: ./. # replace with your published action ref
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          mode: publish
           path: .
           dry-run: "false"
           push: "true"
@@ -50,11 +66,13 @@ jobs:
 
 ## Action inputs
 
-- `mode`: `init` | `check` | `plan` | `release` (default `plan`)
+- `mode`: `init` | `check` | `plan` | `release-pr` | `release` | `publish` (default `plan`)
 - `path`: repository path (default `.`)
-- `from-tag`: optional starting tag
-- `dry-run`: only for `release` (default `true`)
-- `push`: only for `release`; pushes created tag to origin (default `false`)
+- `from-tag`: optional base tag (`plan` / `release-pr` / `release`)
+- `base-branch`: base branch for `release-pr` (default `main`)
+- `pr-branch`: branch for `release-pr` updates (default `release-kthx/release-pr`)
+- `dry-run`: for `release` and `publish` (default `true`)
+- `push`: for `release` and `publish`; pushes created tag to origin (default `true`)
 - `force`: only for `init` (default `false`)
 
 ## Local CLI usage
@@ -63,7 +81,9 @@ jobs:
 cargo run -- init --path .
 cargo run -- check --path .
 cargo run -- plan --path .
+cargo run -- release-pr --path . --base-branch main --pr-branch release-kthx/release-pr
 cargo run -- release --path . --dry-run
+cargo run -- publish --path . --dry-run
 ```
 
 ## Config file
@@ -82,7 +102,11 @@ repository_env = "GITHUB_REPOSITORY"
 
 ## This repository uses itself
 
-This repo includes `release-kthx.toml` and `.github/workflows/self-release.yml` so the action validates and plans releases for itself on every push/PR, and can cut tags via manual dispatch.
+This repo includes `release-kthx.toml` and `.github/workflows/self-release.yml` so it can dogfood the release flow:
+
+1. open/update a release PR with bumped `Cargo.toml` versions,
+2. human merges the PR,
+3. publish job tags the merged version and creates/updates a GitHub release.
 
 ## Workspace layout
 

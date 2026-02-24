@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10,6 +10,22 @@ pub struct CommitRecord {
 }
 
 fn run_git(path: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed executing git {:?}", args))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git {:?} failed: {}", args, stderr.trim());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn run_git_owned(path: &Path, args: &[String]) -> Result<String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(path)
@@ -48,13 +64,18 @@ pub fn latest_tag(path: &Path) -> Result<Option<String>> {
 }
 
 pub fn collect_commits(path: &Path, from_tag: Option<&str>) -> Result<Vec<CommitRecord>> {
-    let mut args = vec!["log", "--pretty=format:%H%x1f%s%x1f%b%x1e"];
-    let range_owned = from_tag.map(|tag| format!("{tag}..HEAD"));
-    if let Some(range) = &range_owned {
-        args.push(range.as_str());
+    let mut args = vec![
+        "log".to_string(),
+        "--no-merges".to_string(),
+        "--invert-grep".to_string(),
+        "--grep=^chore(release):".to_string(),
+        "--pretty=format:%H%x1f%s%x1f%b%x1e".to_string(),
+    ];
+    if let Some(tag) = from_tag {
+        args.push(format!("{tag}..HEAD"));
     }
 
-    let raw = run_git(path, &args)?;
+    let raw = run_git_owned(path, &args)?;
     let mut commits = Vec::new();
 
     for row in raw.split('\u{1e}') {
@@ -105,6 +126,102 @@ pub fn create_annotated_tag(path: &Path, tag_name: &str, message: &str) -> Resul
 
 pub fn push_tag(path: &Path, tag_name: &str) -> Result<()> {
     run_git(path, &["push", "origin", tag_name])?;
+    Ok(())
+}
+
+pub fn checkout_new_branch(path: &Path, branch: &str) -> Result<()> {
+    run_git(path, &["checkout", "-B", branch])?;
+    Ok(())
+}
+
+pub fn ensure_identity(path: &Path) -> Result<()> {
+    let name_output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("config")
+        .arg("user.name")
+        .output()
+        .context("failed reading git user.name")?;
+
+    if !name_output.status.success()
+        || String::from_utf8_lossy(&name_output.stdout)
+            .trim()
+            .is_empty()
+    {
+        run_git(path, &["config", "user.name", "release-kthx[bot]"])?;
+    }
+
+    let email_output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("config")
+        .arg("user.email")
+        .output()
+        .context("failed reading git user.email")?;
+
+    if !email_output.status.success()
+        || String::from_utf8_lossy(&email_output.stdout)
+            .trim()
+            .is_empty()
+    {
+        run_git(
+            path,
+            &[
+                "config",
+                "user.email",
+                "release-kthx[bot]@users.noreply.github.com",
+            ],
+        )?;
+    }
+
+    Ok(())
+}
+
+pub fn add_files(path: &Path, files: &[PathBuf]) -> Result<()> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    let mut args = vec!["add".to_string()];
+    for file in files {
+        args.push(file.to_string_lossy().to_string());
+    }
+    run_git_owned(path, &args)?;
+    Ok(())
+}
+
+pub fn has_staged_changes(path: &Path) -> Result<bool> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("diff")
+        .arg("--cached")
+        .arg("--quiet")
+        .status()
+        .context("failed checking staged changes")?;
+
+    match status.code() {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => bail!("failed checking staged changes"),
+    }
+}
+
+pub fn commit(path: &Path, message: &str) -> Result<()> {
+    run_git(path, &["commit", "-m", message])?;
+    Ok(())
+}
+
+pub fn push_branch(path: &Path, branch: &str) -> Result<()> {
+    run_git(
+        path,
+        &[
+            "push",
+            "--force-with-lease",
+            "--set-upstream",
+            "origin",
+            branch,
+        ],
+    )?;
     Ok(())
 }
 

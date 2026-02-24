@@ -4,7 +4,7 @@ author: release-kthx
 
 inputs:
   mode:
-    description: "Command to execute: init | check | plan | release"
+    description: "Command to execute: init | check | plan | release-pr | release | publish"
     required: false
     default: plan
   path:
@@ -12,16 +12,24 @@ inputs:
     required: false
     default: .
   from-tag:
-    description: "Optional base tag for commit range"
+    description: "Optional base tag for commit range (plan/release-pr/release)"
     required: false
+  base-branch:
+    description: "Base branch for release-pr mode"
+    required: false
+    default: "main"
+  pr-branch:
+    description: "Branch name used for release-pr mode"
+    required: false
+    default: "release-kthx/release-pr"
   dry-run:
-    description: "When mode=release, do not create a git tag"
+    description: "When mode=release or publish, do not create git tag/release"
     required: false
     default: "true"
   push:
-    description: "When mode=release and dry-run=false, push created tag to origin"
+    description: "When mode=release/publish and dry-run=false, push created tag to origin"
     required: false
-    default: "false"
+    default: "true"
   force:
     description: "When mode=init, overwrite existing release-kthx.toml"
     required: false

@@ -178,6 +178,7 @@ dependencies = [
  "semver",
  "serde",
  "toml",
+ "toml_edit",
 ]
 
 [[package]]

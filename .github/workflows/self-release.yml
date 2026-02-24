@@ -7,23 +7,23 @@ on:
   workflow_dispatch:
     inputs:
       from_tag:
-        description: Optional base tag for release range
+        description: Optional base tag override for release PR planning
         required: false
         type: string
-      dry_run:
-        description: Run release without creating a tag
+      base_branch:
+        description: Base branch used by release-pr mode
         required: true
-        default: true
-        type: boolean
-      push_tag:
-        description: Push created tag to origin (ignored when dry_run=true)
+        default: main
+        type: string
+      pr_branch:
+        description: Branch used to hold release PR changes
         required: true
-        default: false
-        type: boolean
+        default: release-kthx/release-pr
+        type: string
 
 jobs:
   verify:
-    if: github.event_name != 'workflow_dispatch'
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -45,8 +45,68 @@ jobs:
           mode: plan
           path: .
 
-  release:
-    if: github.event_name == 'workflow_dispatch'
+  release_pr:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect merged release payload
+        id: detect_release_payload
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          before="${{ github.event.before }}"
+          after="${{ github.sha }}"
+
+          if [[ "$before" == "0000000000000000000000000000000000000000" ]]; then
+            echo "skip_release_pr=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          mapfile -t files < <(git diff --name-only "$before" "$after")
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "skip_release_pr=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          has_manifest=false
+          for file in "${files[@]}"; do
+            if [[ "$file" =~ (^|/)Cargo.toml$ ]]; then
+              has_manifest=true
+              continue
+            fi
+            echo "skip_release_pr=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          done
+
+          if [[ "$has_manifest" == true ]]; then
+            echo "skip_release_pr=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip_release_pr=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create or update release PR
+        if: github.event_name == 'workflow_dispatch' || steps.detect_release_payload.outputs.skip_release_pr != 'true'
+        uses: ./.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          mode: release-pr
+          path: .
+          from-tag: ${{ github.event_name == 'workflow_dispatch' && inputs.from_tag || '' }}
+          base-branch: ${{ github.event_name == 'workflow_dispatch' && inputs.base_branch || 'main' }}
+          pr-branch: ${{ github.event_name == 'workflow_dispatch' && inputs.pr_branch || 'release-kthx/release-pr' }}
+
+  publish:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -56,11 +116,50 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Release this repository
+      - name: Detect release-merge payload
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          before="${{ github.event.before }}"
+          after="${{ github.sha }}"
+
+          if [[ "$before" == "0000000000000000000000000000000000000000" ]]; then
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          mapfile -t files < <(git diff --name-only "$before" "$after")
+
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          has_manifest=false
+          for file in "${files[@]}"; do
+            if [[ "$file" =~ (^|/)Cargo.toml$ ]]; then
+              has_manifest=true
+              continue
+            fi
+            echo "non-release file changed: $file"
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          done
+
+          if [[ "$has_manifest" == true ]]; then
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish merged release
+        if: steps.detect.outputs.should_publish == 'true'
         uses: ./.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         with:
-          mode: release
+          mode: publish
           path: .
-          from-tag: ${{ inputs.from_tag }}
-          dry-run: ${{ inputs.dry_run }}
-          push: ${{ inputs.push_tag }}
+          dry-run: "false"
+          push: "true"
