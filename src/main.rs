@@ -111,7 +111,13 @@ fn run_release_pr(
 
     git::checkout_new_branch(&path, pr_branch)?;
 
-    let changed_manifests = release::set_crate_versions(&path, &plans)?;
+    let mut changed_manifests = release::set_crate_versions(&path, &plans)?;
+    if release::set_lockfile_versions(&path, &plans)? {
+        changed_manifests.push(PathBuf::from("Cargo.lock"));
+    }
+    changed_manifests.sort();
+    changed_manifests.dedup();
+
     if changed_manifests.is_empty() {
         bail!("no Cargo.toml version fields found to update");
     }

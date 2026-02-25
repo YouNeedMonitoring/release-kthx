@@ -114,6 +114,61 @@ pub fn set_crate_versions(path: &Path, plans: &[CrateReleasePlan]) -> Result<Vec
     Ok(changed)
 }
 
+pub fn set_lockfile_versions(path: &Path, plans: &[CrateReleasePlan]) -> Result<bool> {
+    let lock_path = path.join("Cargo.lock");
+    if !lock_path.exists() {
+        return Ok(false);
+    }
+
+    let original = fs::read_to_string(&lock_path)
+        .with_context(|| format!("failed reading {}", lock_path.display()))?;
+    let mut doc = original
+        .parse::<DocumentMut>()
+        .with_context(|| format!("failed parsing {}", lock_path.display()))?;
+
+    let mut changed = false;
+
+    let package_item = match doc.get_mut("package") {
+        Some(item) => item,
+        None => return Ok(false),
+    };
+    let Some(packages) = package_item.as_array_of_tables_mut() else {
+        return Ok(false);
+    };
+
+    for package in packages.iter_mut() {
+        let Some(name) = package.get("name").and_then(|item| item.as_str()) else {
+            continue;
+        };
+
+        let Some(plan) = plans.iter().find(|plan| plan.crate_name == name) else {
+            continue;
+        };
+
+        let next_version = plan.plan.next_version.to_string();
+        let current = package.get("version").and_then(|item| item.as_str());
+        if current == Some(next_version.as_str()) {
+            continue;
+        }
+
+        package.insert("version", value(next_version));
+        changed = true;
+    }
+
+    if !changed {
+        return Ok(false);
+    }
+
+    let rendered = doc.to_string();
+    if rendered == original {
+        return Ok(false);
+    }
+
+    fs::write(&lock_path, rendered)
+        .with_context(|| format!("failed writing {}", lock_path.display()))?;
+    Ok(true)
+}
+
 pub fn render_tag_name(
     tag_template: &str,
     crate_name: &str,
@@ -303,6 +358,21 @@ fn set_table_item_version(item: &mut Item, next_version: &Version) -> Result<boo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use release_kthx_domain::BumpLevel;
+
+    fn test_plan(crate_name: &str, current: &str, next: &str) -> CrateReleasePlan {
+        CrateReleasePlan {
+            crate_name: crate_name.to_string(),
+            manifest_path: PathBuf::from(format!("crates/{crate_name}/Cargo.toml")),
+            plan: ReleasePlan {
+                base_tag: None,
+                current_version: Version::parse(current).expect("valid semver"),
+                next_version: Version::parse(next).expect("valid semver"),
+                bump_level: BumpLevel::Patch,
+                commits: Vec::new(),
+            },
+        }
+    }
 
     #[test]
     fn tag_template_requires_crate_placeholder_for_multiple_crates() {
@@ -325,5 +395,28 @@ mod tests {
         )
         .expect("tag renders");
         assert_eq!(tag, "my-crate-v0.2.0");
+    }
+
+    #[test]
+    fn updates_workspace_package_versions_in_lockfile() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let lock_path = temp.path().join("Cargo.lock");
+        fs::write(
+            &lock_path,
+            "version = 4\n\n[[package]]\nname = \"release-kthx\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"release-kthx-domain\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write lock");
+
+        let plans = vec![
+            test_plan("release-kthx", "0.1.0", "0.1.1"),
+            test_plan("release-kthx-domain", "0.1.0", "0.2.0"),
+        ];
+
+        let changed = set_lockfile_versions(temp.path(), &plans).expect("lock update");
+        assert!(changed);
+
+        let updated = fs::read_to_string(&lock_path).expect("read updated lock");
+        assert!(updated.contains("name = \"release-kthx\"\nversion = \"0.1.1\""));
+        assert!(updated.contains("name = \"release-kthx-domain\"\nversion = \"0.2.0\""));
     }
 }

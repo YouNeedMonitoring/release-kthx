@@ -46,7 +46,60 @@ fn format_gh_error(args: &[&str], stderr: &str) -> String {
         );
     }
 
+    if stderr.contains("repository.pullRequest.projectCards")
+        || stderr.contains("Projects (classic) is being deprecated")
+    {
+        return format!(
+            "GitHub CLI failed due to a legacy Projects(classic) GraphQL field.\n\
+             This usually comes from older gh flows using projectCards.\n\
+             release-kthx now uses REST for PR updates to avoid this, so rerun after updating to the latest action commit.\n\n\
+             Original gh args: {:?}\n\
+             Original error: {}",
+            args, stderr
+        );
+    }
+
     format!("gh {:?} failed: {}", args, stderr)
+}
+
+fn repository_slug() -> Result<String> {
+    env::var("GITHUB_REPOSITORY").with_context(|| "missing GITHUB_REPOSITORY environment variable")
+}
+
+fn update_pull_request(
+    path: &Path,
+    token_env: &str,
+    pr_number: &str,
+    title: &str,
+    body: &str,
+) -> Result<()> {
+    let repo = repository_slug()?;
+    let endpoint = format!("repos/{repo}/pulls/{pr_number}");
+    run_gh(
+        path,
+        token_env,
+        &[
+            "api",
+            "--method",
+            "PATCH",
+            endpoint.as_str(),
+            "-f",
+            &format!("title={title}"),
+            "-f",
+            &format!("body={body}"),
+        ],
+    )?;
+    Ok(())
+}
+
+fn pull_request_url(path: &Path, token_env: &str, pr_number: &str) -> Result<String> {
+    let repo = repository_slug()?;
+    let endpoint = format!("repos/{repo}/pulls/{pr_number}");
+    run_gh(
+        path,
+        token_env,
+        &["api", endpoint.as_str(), "--jq", ".html_url"],
+    )
 }
 
 fn run_gh_optional(path: &Path, token_env: &str, args: &[&str]) -> Result<Option<String>> {
@@ -94,16 +147,8 @@ pub fn create_or_update_release_pr(
     )?;
 
     if let Some(number) = existing_number {
-        run_gh(
-            path,
-            token_env,
-            &["pr", "edit", &number, "--title", title, "--body", body],
-        )?;
-        let pr_url = run_gh(
-            path,
-            token_env,
-            &["pr", "view", &number, "--json", "url", "--jq", ".url"],
-        )?;
+        update_pull_request(path, token_env, &number, title, body)?;
+        let pr_url = pull_request_url(path, token_env, &number)?;
         Ok(pr_url)
     } else {
         let pr_url = run_gh(
