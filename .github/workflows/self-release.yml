@@ -83,6 +83,9 @@ jobs:
               has_manifest=true
               continue
             fi
+            if [[ "$file" == "Cargo.lock" ]]; then
+              continue
+            fi
             echo "skip_release_pr=false" >> "$GITHUB_OUTPUT"
             exit 0
           done
@@ -140,6 +143,9 @@ jobs:
           for file in "${files[@]}"; do
             if [[ "$file" =~ (^|/)Cargo.toml$ ]]; then
               has_manifest=true
+              continue
+            fi
+            if [[ "$file" == "Cargo.lock" ]]; then
               continue
             fi
             echo "non-release file changed: $file"
