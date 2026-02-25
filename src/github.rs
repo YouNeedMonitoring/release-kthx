@@ -8,10 +8,10 @@ fn build_gh_command(path: &Path, token_env: &str, args: &[&str]) -> Command {
     cmd.current_dir(path);
     cmd.args(args);
 
-    if env::var("GH_TOKEN").is_err() {
-        if let Ok(token) = env::var(token_env) {
-            cmd.env("GH_TOKEN", token);
-        }
+    if env::var("GH_TOKEN").is_err()
+        && let Ok(token) = env::var(token_env)
+    {
+        cmd.env("GH_TOKEN", token);
     }
 
     cmd
