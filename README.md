@@ -9,7 +9,7 @@ It ships first as a GitHub Action (Docker action), with a Rust CLI runtime insid
 - No crates.io dependency in the default flow
 - Conventional-commit based version planning from git history
 - Works with org-private repos and custom GitHub tokens in CI
-- PR-first release flow: open release PR with version bumps, publish after merge
+- PR-first release flow per crate: open release PR with crate version bumps, publish crate tags/releases after merge
 
 ## GitHub Action usage
 
@@ -92,7 +92,7 @@ cargo run -- publish --path . --dry-run
 
 ```toml
 [release]
-tag_template = "v{{ version }}"
+tag_template = "{{ crate }}-v{{ version }}"
 
 [github]
 create_release = true
@@ -106,7 +106,7 @@ This repo includes `release-kthx.toml` and `.github/workflows/self-release.yml` 
 
 1. open/update a release PR with bumped `Cargo.toml` versions,
 2. human merges the PR,
-3. publish job tags the merged version and creates/updates a GitHub release.
+3. publish job creates tags/releases per crate version (for crates changed in the release PR merge).
 
 ## Workspace layout
 

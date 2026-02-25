@@ -65,16 +65,14 @@ fn load_config(path: &Path) -> Result<ReleaseKthxConfig> {
 
 fn run_plan(path: PathBuf, from_tag: Option<String>) -> Result<()> {
     let cfg = load_config(&path)?;
-    let Some(plan) = release::build_release_plan_optional(&path, from_tag.as_deref())? else {
+    let plans = release::build_crate_release_plans(&path, from_tag.as_deref())?;
+    if plans.is_empty() {
         println!("no releasable changes detected");
         return Ok(());
-    };
+    }
 
     println!("repo: {}", path.display());
-    println!("base-version: {}", plan.current_version);
-    println!("next-version: {}", plan.next_version);
-    println!("bump: {}", plan.bump_level);
-    println!("commits: {}", plan.commits.len());
+    println!("crates-with-releases: {}", plans.len());
     println!(
         "github-release: {}",
         if cfg.github.create_release {
@@ -83,7 +81,18 @@ fn run_plan(path: PathBuf, from_tag: Option<String>) -> Result<()> {
             "disabled"
         }
     );
-    println!("\n{}", changelog::render_markdown(&plan));
+
+    for crate_plan in &plans {
+        println!();
+        println!("crate: {}", crate_plan.crate_name);
+        println!("manifest: {}", crate_plan.manifest_path.display());
+        println!("base-version: {}", crate_plan.plan.current_version);
+        println!("next-version: {}", crate_plan.plan.next_version);
+        println!("bump: {}", crate_plan.plan.bump_level);
+        println!("commits: {}", crate_plan.plan.commits.len());
+        println!("{}", changelog::render_markdown(&crate_plan.plan));
+    }
+
     Ok(())
 }
 
@@ -94,13 +103,15 @@ fn run_release_pr(
     pr_branch: &str,
 ) -> Result<()> {
     let cfg = load_config(&path)?;
-    let Some(plan) = release::build_release_plan_optional(&path, from_tag.as_deref())? else {
+    let plans = release::build_crate_release_plans(&path, from_tag.as_deref())?;
+    if plans.is_empty() {
         println!("no releasable changes detected; skipping release PR");
         return Ok(());
-    };
+    }
 
     git::checkout_new_branch(&path, pr_branch)?;
-    let changed_manifests = release::set_workspace_versions(&path, &plan.next_version)?;
+
+    let changed_manifests = release::set_crate_versions(&path, &plans)?;
     if changed_manifests.is_empty() {
         bail!("no Cargo.toml version fields found to update");
     }
@@ -108,7 +119,7 @@ fn run_release_pr(
     git::ensure_identity(&path)?;
     git::add_files(&path, &changed_manifests)?;
 
-    let title = format!("chore(release): v{}", plan.next_version);
+    let title = release_pr_title(&plans);
     if git::has_staged_changes(&path)? {
         git::commit(&path, &title)?;
     } else {
@@ -120,7 +131,7 @@ fn run_release_pr(
 
     git::push_branch(&path, pr_branch)?;
 
-    let body = release_pr_body(&plan, &changed_manifests);
+    let body = release_pr_body(&plans, &changed_manifests);
     let pr_url = github::create_or_update_release_pr(
         &path,
         &cfg.github.token_env,
@@ -134,56 +145,103 @@ fn run_release_pr(
     Ok(())
 }
 
-fn release_pr_body(plan: &release::ReleasePlan, changed_manifests: &[PathBuf]) -> String {
+fn release_pr_title(plans: &[release::CrateReleasePlan]) -> String {
+    if plans.len() == 1 {
+        let plan = &plans[0];
+        return format!(
+            "chore(release): {} v{}",
+            plan.crate_name, plan.plan.next_version
+        );
+    }
+
+    format!("chore(release): release {} crates", plans.len())
+}
+
+fn release_pr_body(plans: &[release::CrateReleasePlan], changed_manifests: &[PathBuf]) -> String {
     let mut body = String::new();
     body.push_str("## Release PR\n\n");
-    body.push_str(&format!("- Current version: `{}`\n", plan.current_version));
-    body.push_str(&format!("- Next version: `{}`\n", plan.next_version));
-    body.push_str(&format!("- Bump: `{}`\n\n", plan.bump_level));
-    body.push_str("## Changed manifests\n");
+    body.push_str("## Crates\n");
+    body.push_str("| Crate | Current | Next | Bump |\n");
+    body.push_str("|---|---|---|---|\n");
+    for crate_plan in plans {
+        body.push_str(&format!(
+            "| `{}` | `{}` | `{}` | `{}` |\n",
+            crate_plan.crate_name,
+            crate_plan.plan.current_version,
+            crate_plan.plan.next_version,
+            crate_plan.plan.bump_level
+        ));
+    }
+
+    body.push_str("\n## Changed manifests\n");
     for manifest in changed_manifests {
         body.push_str(&format!("- `{}`\n", manifest.display()));
     }
-    body.push('\n');
-    body.push_str(&changelog::render_markdown(plan));
+
+    for crate_plan in plans {
+        body.push_str(&format!("\n## {}\n\n", crate_plan.crate_name));
+        body.push_str(&changelog::render_markdown(&crate_plan.plan));
+    }
+
     body
 }
 
 fn run_release(path: PathBuf, from_tag: Option<String>, dry_run: bool, push: bool) -> Result<()> {
     let cfg = load_config(&path)?;
-    let plan = release::build_release_plan(&path, from_tag.as_deref())?;
-    let tag_name = cfg
-        .release
-        .tag_template
-        .replace("{{ version }}", &plan.next_version.to_string());
-
-    println!("release plan:");
-    println!("- next-version: {}", plan.next_version);
-    println!("- tag: {}", tag_name);
-    println!("- bump: {}", plan.bump_level);
-    println!("- commits: {}", plan.commits.len());
-
-    if dry_run {
-        println!("dry-run enabled, no git tag created");
+    let plans = release::build_crate_release_plans(&path, from_tag.as_deref())?;
+    if plans.is_empty() {
+        println!("no releasable changes detected");
         return Ok(());
     }
 
-    git::create_annotated_tag(&path, &tag_name, &format!("Release {}", plan.next_version))?;
-    println!("created tag {}", tag_name);
-    if push {
-        git::push_tag(&path, &tag_name)?;
-        println!("pushed tag {} to origin", tag_name);
-    } else {
+    let crate_count = plans.len();
+    let mut targets = Vec::new();
+    for crate_plan in plans {
+        let tag_name = release::render_tag_name(
+            &cfg.release.tag_template,
+            &crate_plan.crate_name,
+            &crate_plan.plan.next_version,
+            crate_count,
+        )?;
+        targets.push((crate_plan, tag_name));
+    }
+
+    println!("release plan:");
+    for (crate_plan, tag_name) in &targets {
         println!(
-            "push with: git -C {} push origin {}",
-            path.display(),
+            "- {} {} -> {} ({}) tag={}",
+            crate_plan.crate_name,
+            crate_plan.plan.current_version,
+            crate_plan.plan.next_version,
+            crate_plan.plan.bump_level,
             tag_name
         );
     }
 
+    if dry_run {
+        println!("dry-run enabled, no git tags created");
+        return Ok(());
+    }
+
+    for (crate_plan, tag_name) in &targets {
+        git::create_annotated_tag(
+            &path,
+            tag_name,
+            &format!(
+                "Release {} {}",
+                crate_plan.crate_name, crate_plan.plan.next_version
+            ),
+        )?;
+        println!("created tag {}", tag_name);
+        if push {
+            git::push_tag(&path, tag_name)?;
+            println!("pushed tag {} to origin", tag_name);
+        }
+    }
+
     if cfg.github.create_release {
         println!(
-            "github release enabled in config. use your CI token ({}) to publish release notes.",
+            "github release enabled in config. publish mode will create per-crate releases using token env {}.",
             cfg.github.token_env
         );
     }
@@ -192,43 +250,74 @@ fn run_release(path: PathBuf, from_tag: Option<String>, dry_run: bool, push: boo
 
 fn run_publish(path: PathBuf, dry_run: bool, push: bool) -> Result<()> {
     let cfg = load_config(&path)?;
-    let version = release::current_version(&path)?;
-    let tag_name = cfg
-        .release
-        .tag_template
-        .replace("{{ version }}", &version.to_string());
+    let crates = release::collect_crates(&path)?;
+    if crates.is_empty() {
+        bail!("no Cargo package manifests found");
+    }
+
+    let crate_count = crates.len();
+    let mut pending = Vec::new();
+    for crate_info in crates {
+        let tag_name = release::render_tag_name(
+            &cfg.release.tag_template,
+            &crate_info.name,
+            &crate_info.version,
+            crate_count,
+        )?;
+
+        if git::tag_exists(&path, &tag_name)? {
+            continue;
+        }
+
+        pending.push((crate_info, tag_name));
+    }
+
+    if pending.is_empty() {
+        println!("publish plan: no new crate versions to tag or release");
+        return Ok(());
+    }
 
     println!("publish plan:");
-    println!("- version: {}", version);
-    println!("- tag: {}", tag_name);
+    for (crate_info, tag_name) in &pending {
+        println!(
+            "- crate: {} version: {} tag: {}",
+            crate_info.name, crate_info.version, tag_name
+        );
+    }
 
     if dry_run {
         println!("dry-run enabled, no tag or github release created");
         return Ok(());
     }
 
-    git::create_annotated_tag(&path, &tag_name, &format!("Release {}", version))?;
-    println!("created tag {}", tag_name);
-
-    if push {
-        git::push_tag(&path, &tag_name)?;
-        println!("pushed tag {} to origin", tag_name);
-    }
-
-    if cfg.github.create_release {
-        let title = format!("Release {}", version);
-        let notes = format!(
-            "Automated publish for `{}`.\n\nThis release is created after the release PR merge.",
-            version
-        );
-        let release_url = github::create_or_update_release(
+    for (crate_info, tag_name) in &pending {
+        git::create_annotated_tag(
             &path,
-            &cfg.github.token_env,
-            &tag_name,
-            &title,
-            &notes,
+            tag_name,
+            &format!("Release {} {}", crate_info.name, crate_info.version),
         )?;
-        println!("github release: {}", release_url);
+        println!("created tag {}", tag_name);
+
+        if push {
+            git::push_tag(&path, tag_name)?;
+            println!("pushed tag {} to origin", tag_name);
+        }
+
+        if cfg.github.create_release {
+            let title = format!("Release {} {}", crate_info.name, crate_info.version);
+            let notes = format!(
+                "Automated publish for crate `{}` at version `{}`.",
+                crate_info.name, crate_info.version
+            );
+            let release_url = github::create_or_update_release(
+                &path,
+                &cfg.github.token_env,
+                tag_name,
+                &title,
+                &notes,
+            )?;
+            println!("github release: {}", release_url);
+        }
     }
 
     Ok(())

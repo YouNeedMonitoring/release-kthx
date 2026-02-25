@@ -1,90 +1,215 @@
-use crate::git;
-use anyhow::{Context, Result};
+use crate::git::{CliCommitHistoryService, CommitHistoryService};
+use anyhow::{Context, Result, bail};
 pub use release_kthx_domain::{CommitKind, ReleasePlan};
 use semver::Version;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use toml::Value;
 use toml_edit::{DocumentMut, Item, value};
 
-pub fn build_release_plan(path: &Path, from_tag: Option<&str>) -> Result<ReleasePlan> {
-    build_release_plan_optional(path, from_tag)?
-        .ok_or_else(|| anyhow::anyhow!("no releasable changes found"))
+#[derive(Debug, Clone)]
+pub struct CrateInfo {
+    pub name: String,
+    pub manifest_path: PathBuf,
+    pub crate_dir: PathBuf,
+    pub version: Version,
 }
 
-pub fn build_release_plan_optional(
-    path: &Path,
-    from_tag: Option<&str>,
-) -> Result<Option<ReleasePlan>> {
-    let current_version = current_version(path)?;
-    let base_tag = if let Some(explicit) = from_tag {
-        Some(explicit.to_string())
-    } else {
-        git::latest_tag(path)?
-    };
-
-    let raw_commits = git::collect_commits(path, base_tag.as_deref())?;
-    let commits = raw_commits
-        .into_iter()
-        .map(|item| release_kthx_domain::CommitInput {
-            hash: item.hash,
-            subject: item.subject,
-            body: item.body,
-        })
-        .collect::<Vec<_>>();
-
-    Ok(release_kthx_domain::plan_release(
-        current_version,
-        base_tag,
-        commits,
-    ))
+#[derive(Debug, Clone)]
+pub struct CrateReleasePlan {
+    pub crate_name: String,
+    pub manifest_path: PathBuf,
+    pub plan: ReleasePlan,
 }
 
-pub fn current_version(path: &Path) -> Result<Version> {
-    let cargo_toml = path.join("Cargo.toml");
-    let raw = fs::read_to_string(&cargo_toml)
-        .with_context(|| format!("failed reading {}", cargo_toml.display()))?;
-    let value = raw
-        .parse::<Value>()
-        .with_context(|| format!("failed parsing {}", cargo_toml.display()))?;
-
-    let version_str = value
-        .get("package")
-        .and_then(|package| package.get("version"))
-        .and_then(Value::as_str)
-        .or_else(|| {
-            value
-                .get("workspace")
-                .and_then(|workspace| workspace.get("package"))
-                .and_then(|package| package.get("version"))
-                .and_then(Value::as_str)
-        })
-        .ok_or_else(|| {
-            anyhow::anyhow!("cannot find package.version or workspace.package.version")
-        })?;
-
-    let version = Version::parse(version_str)
-        .with_context(|| format!("invalid semver version in {}", cargo_toml.display()))?;
-    Ok(version)
-}
-
-pub fn set_workspace_versions(path: &Path, next_version: &Version) -> Result<Vec<PathBuf>> {
+pub fn collect_crates(path: &Path) -> Result<Vec<CrateInfo>> {
     let mut manifests = Vec::new();
     collect_cargo_manifests(path, &mut manifests)?;
-    manifests.sort();
 
-    let mut changed = Vec::new();
+    let mut crates = Vec::new();
     for manifest in manifests {
-        if set_manifest_version(&manifest, next_version)? {
-            let relative = manifest
-                .strip_prefix(path)
-                .unwrap_or(manifest.as_path())
-                .to_path_buf();
-            changed.push(relative);
+        if let Some(info) = parse_crate_info(path, &manifest)? {
+            crates.push(info);
         }
     }
 
+    crates.sort_by(|a, b| a.manifest_path.cmp(&b.manifest_path));
+    Ok(crates)
+}
+
+pub fn build_crate_release_plans(
+    path: &Path,
+    from_tag: Option<&str>,
+) -> Result<Vec<CrateReleasePlan>> {
+    let history = CliCommitHistoryService;
+    build_crate_release_plans_with_history(&history, path, from_tag)
+}
+
+pub fn build_crate_release_plans_with_history(
+    history: &impl CommitHistoryService,
+    path: &Path,
+    from_tag: Option<&str>,
+) -> Result<Vec<CrateReleasePlan>> {
+    let crates = collect_crates(path)?;
+    if crates.is_empty() {
+        bail!("no Cargo package manifests found");
+    }
+
+    let base_tag = if let Some(explicit) = from_tag {
+        Some(explicit.to_string())
+    } else {
+        history.latest_tag(path)?
+    };
+
+    let raw_commits = history.collect_commits(path, base_tag.as_deref())?;
+    if raw_commits.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut commits_by_crate = vec![Vec::<release_kthx_domain::CommitInput>::new(); crates.len()];
+    for commit in raw_commits {
+        let affected = affected_crates(&crates, &commit.files);
+        for index in affected {
+            commits_by_crate[index].push(release_kthx_domain::CommitInput {
+                hash: commit.hash.clone(),
+                subject: commit.subject.clone(),
+                body: commit.body.clone(),
+            });
+        }
+    }
+
+    let mut plans = Vec::new();
+    for (index, crate_info) in crates.iter().enumerate() {
+        let commit_inputs = std::mem::take(&mut commits_by_crate[index]);
+        let Some(plan) = release_kthx_domain::plan_release(
+            crate_info.version.clone(),
+            base_tag.clone(),
+            commit_inputs,
+        ) else {
+            continue;
+        };
+
+        plans.push(CrateReleasePlan {
+            crate_name: crate_info.name.clone(),
+            manifest_path: crate_info.manifest_path.clone(),
+            plan,
+        });
+    }
+
+    plans.sort_by(|a, b| a.manifest_path.cmp(&b.manifest_path));
+    Ok(plans)
+}
+
+pub fn set_crate_versions(path: &Path, plans: &[CrateReleasePlan]) -> Result<Vec<PathBuf>> {
+    let mut changed = Vec::new();
+    for plan in plans {
+        let manifest_abs = path.join(&plan.manifest_path);
+        if set_manifest_version(&manifest_abs, &plan.plan.next_version)? {
+            changed.push(plan.manifest_path.clone());
+        }
+    }
+    changed.sort();
+    changed.dedup();
     Ok(changed)
+}
+
+pub fn render_tag_name(
+    tag_template: &str,
+    crate_name: &str,
+    version: &Version,
+    crate_count: usize,
+) -> Result<String> {
+    if crate_count > 1 && !tag_template.contains("{{ crate }}") {
+        bail!("release.tag_template must include '{{ crate }}' when multiple crates are released");
+    }
+
+    Ok(tag_template
+        .replace("{{ crate }}", crate_name)
+        .replace("{{ version }}", &version.to_string()))
+}
+
+fn parse_crate_info(repo_root: &Path, manifest_abs: &Path) -> Result<Option<CrateInfo>> {
+    let raw = fs::read_to_string(manifest_abs)
+        .with_context(|| format!("failed reading {}", manifest_abs.display()))?;
+    let value = raw
+        .parse::<Value>()
+        .with_context(|| format!("failed parsing {}", manifest_abs.display()))?;
+
+    let Some(package) = value.get("package") else {
+        return Ok(None);
+    };
+    let Some(name) = package.get("name").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let Some(version_str) = package.get("version").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+
+    let version = Version::parse(version_str)
+        .with_context(|| format!("invalid semver version in {}", manifest_abs.display()))?;
+
+    let manifest_path = manifest_abs
+        .strip_prefix(repo_root)
+        .unwrap_or(manifest_abs)
+        .to_path_buf();
+
+    let crate_dir_abs = manifest_abs.parent().unwrap_or(repo_root);
+    let crate_dir = if crate_dir_abs == repo_root {
+        PathBuf::from(".")
+    } else {
+        crate_dir_abs
+            .strip_prefix(repo_root)
+            .unwrap_or(crate_dir_abs)
+            .to_path_buf()
+    };
+
+    Ok(Some(CrateInfo {
+        name: name.to_string(),
+        manifest_path,
+        crate_dir,
+        version,
+    }))
+}
+
+fn affected_crates(crates: &[CrateInfo], files: &[PathBuf]) -> Vec<usize> {
+    let mut affected = HashSet::new();
+
+    for file in files {
+        let mut winner: Option<(usize, usize)> = None;
+
+        for (index, crate_info) in crates.iter().enumerate() {
+            if !crate_contains_file(&crate_info.crate_dir, file) {
+                continue;
+            }
+
+            let rank = if crate_info.crate_dir == Path::new(".") {
+                0
+            } else {
+                crate_info.crate_dir.components().count()
+            };
+
+            match winner {
+                Some((_, current_rank)) if current_rank >= rank => {}
+                _ => winner = Some((index, rank)),
+            }
+        }
+
+        if let Some((index, _)) = winner {
+            affected.insert(index);
+        }
+    }
+
+    let mut ordered = affected.into_iter().collect::<Vec<_>>();
+    ordered.sort_unstable();
+    ordered
+}
+
+fn crate_contains_file(crate_dir: &Path, file: &Path) -> bool {
+    if crate_dir == Path::new(".") {
+        return true;
+    }
+    file.starts_with(crate_dir)
 }
 
 fn collect_cargo_manifests(dir: &Path, manifests: &mut Vec<PathBuf>) -> Result<()> {
@@ -132,10 +257,9 @@ fn set_manifest_version(manifest_path: &Path, next_version: &Version) -> Result<
         && let Some(workspace_package) = workspace
             .as_table_like_mut()
             .and_then(|table| table.get_mut("package"))
+        && set_table_item_version(workspace_package, next_version)?
     {
-        if set_table_item_version(workspace_package, next_version)? {
-            changed = true;
-        }
+        changed = true;
     }
 
     if !changed {
@@ -181,23 +305,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reads_package_version() {
-        let version = current_version(Path::new(".")).expect("version should parse");
-        assert_eq!(version.to_string(), "0.1.0");
+    fn tag_template_requires_crate_placeholder_for_multiple_crates() {
+        let result = render_tag_name(
+            "v{{ version }}",
+            "my-crate",
+            &Version::parse("0.2.0").expect("valid semver"),
+            2,
+        );
+        assert!(result.is_err());
     }
 
     #[test]
-    fn updates_manifest_string() {
-        let mut doc = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n"
-            .parse::<DocumentMut>()
-            .expect("doc parses");
-        let changed = set_item_version(
-            &mut doc,
-            "package",
+    fn tag_template_renders_crate_and_version() {
+        let tag = render_tag_name(
+            "{{ crate }}-v{{ version }}",
+            "my-crate",
             &Version::parse("0.2.0").expect("valid semver"),
+            2,
         )
-        .expect("set version");
-        assert!(changed);
-        assert!(doc.to_string().contains("0.2.0"));
+        .expect("tag renders");
+        assert_eq!(tag, "my-crate-v0.2.0");
     }
 }

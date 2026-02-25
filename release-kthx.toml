@@ -1,5 +1,5 @@
 [release]
-tag_template = "release-kthx-v{{ version }}"
+tag_template = "{{ crate }}-v{{ version }}"
 
 [github]
 create_release = true

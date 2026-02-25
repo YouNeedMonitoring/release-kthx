@@ -19,7 +19,7 @@ pub struct ReleaseConfig {
 impl Default for ReleaseConfig {
     fn default() -> Self {
         Self {
-            tag_template: "v{{ version }}".to_string(),
+            tag_template: "{{ crate }}-v{{ version }}".to_string(),
         }
     }
 }

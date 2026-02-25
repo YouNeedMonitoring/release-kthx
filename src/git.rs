@@ -7,6 +7,25 @@ pub struct CommitRecord {
     pub hash: String,
     pub subject: String,
     pub body: String,
+    pub files: Vec<PathBuf>,
+}
+
+pub trait CommitHistoryService {
+    fn latest_tag(&self, path: &Path) -> Result<Option<String>>;
+    fn collect_commits(&self, path: &Path, from_tag: Option<&str>) -> Result<Vec<CommitRecord>>;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CliCommitHistoryService;
+
+impl CommitHistoryService for CliCommitHistoryService {
+    fn latest_tag(&self, path: &Path) -> Result<Option<String>> {
+        latest_tag(path)
+    }
+
+    fn collect_commits(&self, path: &Path, from_tag: Option<&str>) -> Result<Vec<CommitRecord>> {
+        collect_commits(path, from_tag)
+    }
 }
 
 fn run_git(path: &Path, args: &[&str]) -> Result<String> {
@@ -39,6 +58,22 @@ fn run_git_owned(path: &Path, args: &[String]) -> Result<String> {
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn commit_files(path: &Path, hash: &str) -> Result<Vec<PathBuf>> {
+    let args = vec![
+        "show".to_string(),
+        "--pretty=format:".to_string(),
+        "--name-only".to_string(),
+        hash.to_string(),
+    ];
+    let raw = run_git_owned(path, &args)?;
+    Ok(raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .collect::<Vec<_>>())
 }
 
 pub fn latest_tag(path: &Path) -> Result<Option<String>> {
@@ -87,6 +122,7 @@ pub fn collect_commits(path: &Path, from_tag: Option<&str>) -> Result<Vec<Commit
         let hash = parts.next().unwrap_or_default().trim().to_string();
         let subject = parts.next().unwrap_or_default().trim().to_string();
         let body = parts.next().unwrap_or_default().trim().to_string();
+        let files = commit_files(path, &hash)?;
 
         if hash.is_empty() || subject.is_empty() {
             continue;
@@ -96,6 +132,7 @@ pub fn collect_commits(path: &Path, from_tag: Option<&str>) -> Result<Vec<Commit
             hash,
             subject,
             body,
+            files,
         });
     }
 
@@ -227,6 +264,94 @@ pub fn push_branch(path: &Path, branch: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn run_git_ok(repo: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("git command should run");
+
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn run_git_output(repo: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("git command should run");
+
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn init_repo() -> TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        run_git_ok(dir.path(), &["init"]);
+        run_git_ok(dir.path(), &["config", "user.name", "tester"]);
+        run_git_ok(dir.path(), &["config", "user.email", "tester@example.com"]);
+        dir
+    }
+
+    fn write_file(repo: &Path, relative: &str, content: &str) {
+        let path = repo.join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create parent directories");
+        }
+        fs::write(path, content).expect("write file");
+    }
+
+    fn commit_files(
+        repo: &Path,
+        files: &[(&str, &str)],
+        subject: &str,
+        body: Option<&str>,
+    ) -> String {
+        for (relative, content) in files {
+            write_file(repo, relative, content);
+            run_git_ok(repo, &["add", relative]);
+        }
+
+        let mut cmd = Command::new("git");
+        cmd.arg("-C")
+            .arg(repo)
+            .arg("commit")
+            .arg("--no-gpg-sign")
+            .arg("-m")
+            .arg(subject);
+        if let Some(body_text) = body {
+            cmd.arg("-m").arg(body_text);
+        }
+
+        let output = cmd.output().expect("commit should run");
+        assert!(
+            output.status.success(),
+            "commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        run_git_output(repo, &["rev-parse", "HEAD"])
+    }
+
     #[test]
     fn parse_empty_log_output() {
         let mut commits = Vec::new();
@@ -237,5 +362,109 @@ mod tests {
             }
         }
         assert!(commits.is_empty());
+    }
+
+    #[test]
+    fn collect_commits_reads_changed_files_from_real_repo() {
+        let repo = init_repo();
+        let repo_path = repo.path();
+
+        commit_files(
+            repo_path,
+            &[("src/lib.rs", "pub fn one() {}\n")],
+            "feat: add library",
+            Some("domain change"),
+        );
+
+        commit_files(
+            repo_path,
+            &[
+                ("crates/release-kthx-domain/src/lib.rs", "pub fn two() {}\n"),
+                ("README.md", "# repo\n"),
+            ],
+            "fix: patch parser",
+            None,
+        );
+
+        let commits = collect_commits(repo_path, None).expect("collect commits");
+        assert_eq!(commits.len(), 2);
+
+        let fix = commits
+            .iter()
+            .find(|c| c.subject == "fix: patch parser")
+            .expect("fix commit exists");
+        assert!(fix.files.contains(&PathBuf::from("README.md")));
+        assert!(
+            fix.files
+                .contains(&PathBuf::from("crates/release-kthx-domain/src/lib.rs"))
+        );
+
+        let feat = commits
+            .iter()
+            .find(|c| c.subject == "feat: add library")
+            .expect("feat commit exists");
+        assert!(feat.files.contains(&PathBuf::from("src/lib.rs")));
+        assert!(feat.body.contains("domain change"));
+    }
+
+    #[test]
+    fn collect_commits_respects_tag_range_and_skips_release_commits() {
+        let repo = init_repo();
+        let repo_path = repo.path();
+
+        commit_files(
+            repo_path,
+            &[("src/lib.rs", "pub fn baseline() {}\n")],
+            "feat: baseline",
+            None,
+        );
+        run_git_ok(repo_path, &["tag", "v0.1.0"]);
+
+        commit_files(
+            repo_path,
+            &[("src/lib.rs", "pub fn baseline() { let _x = 1; }\n")],
+            "fix: apply patch",
+            None,
+        );
+
+        commit_files(
+            repo_path,
+            &[(
+                "Cargo.toml",
+                "[package]\nname=\"demo\"\nversion=\"0.1.1\"\n",
+            )],
+            "chore(release): v0.1.1",
+            None,
+        );
+
+        let commits = collect_commits(repo_path, Some("v0.1.0")).expect("collect commits");
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].subject, "fix: apply patch");
+        assert!(commits[0].files.contains(&PathBuf::from("src/lib.rs")));
+    }
+
+    #[test]
+    fn latest_tag_detects_head_tag() {
+        let repo = init_repo();
+        let repo_path = repo.path();
+
+        commit_files(
+            repo_path,
+            &[("src/lib.rs", "pub fn baseline() {}\n")],
+            "feat: baseline",
+            None,
+        );
+        run_git_ok(repo_path, &["tag", "v0.1.0"]);
+
+        commit_files(
+            repo_path,
+            &[("src/lib.rs", "pub fn baseline() { let _x = 1; }\n")],
+            "fix: patch",
+            None,
+        );
+        run_git_ok(repo_path, &["tag", "v0.1.1"]);
+
+        let tag = latest_tag(repo_path).expect("latest tag");
+        assert_eq!(tag.as_deref(), Some("v0.1.1"));
     }
 }
