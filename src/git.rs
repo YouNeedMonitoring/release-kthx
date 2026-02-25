@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -186,6 +186,23 @@ pub fn collect_commits(path: &Path, from_tag: Option<&str>) -> Result<Vec<Commit
     }
 
     Ok(commits)
+}
+
+pub fn changed_files_between(path: &Path, before: &str, after: &str) -> Result<Vec<PathBuf>> {
+    let args = vec![
+        "diff".to_string(),
+        "--name-only".to_string(),
+        before.to_string(),
+        after.to_string(),
+    ];
+
+    let raw = run_git_owned(path, &args)?;
+    Ok(raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .collect::<Vec<_>>())
 }
 
 pub fn tag_exists(path: &Path, tag_name: &str) -> Result<bool> {
@@ -443,9 +460,10 @@ mod tests {
             .find(|c| c.subject == "fix: patch parser")
             .expect("fix commit exists");
         assert!(fix.files.contains(&PathBuf::from("README.md")));
-        assert!(fix
-            .files
-            .contains(&PathBuf::from("crates/release-kthx-domain/src/lib.rs")));
+        assert!(
+            fix.files
+                .contains(&PathBuf::from("crates/release-kthx-domain/src/lib.rs"))
+        );
 
         let feat = commits
             .iter()
@@ -514,5 +532,37 @@ mod tests {
 
         let tag = latest_tag(repo_path).expect("latest tag");
         assert_eq!(tag.as_deref(), Some("v0.1.1"));
+    }
+
+    #[test]
+    fn changed_files_between_returns_expected_paths() {
+        let repo = init_repo();
+        let repo_path = repo.path();
+
+        commit_files(
+            repo_path,
+            &[("src/lib.rs", "pub fn one() {}\n")],
+            "feat: one",
+            None,
+        );
+        let before = run_git_output(repo_path, &["rev-parse", "HEAD"]);
+
+        commit_files(
+            repo_path,
+            &[
+                ("src/lib.rs", "pub fn two() {}\n"),
+                (
+                    "Cargo.toml",
+                    "[package]\nname=\"demo\"\nversion=\"0.1.0\"\n",
+                ),
+            ],
+            "fix: two",
+            None,
+        );
+        let after = run_git_output(repo_path, &["rev-parse", "HEAD"]);
+
+        let files = changed_files_between(repo_path, &before, &after).expect("changed files");
+        assert!(files.contains(&PathBuf::from("Cargo.toml")));
+        assert!(files.contains(&PathBuf::from("src/lib.rs")));
     }
 }

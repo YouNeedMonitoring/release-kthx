@@ -293,6 +293,7 @@ dependencies = [
  "release-kthx-domain",
  "semver",
  "serde",
+ "serde_json",
  "tempfile",
  "toml",
  "toml_edit",

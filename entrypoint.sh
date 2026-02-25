@@ -79,9 +79,18 @@ case "$mode" in
       args+=(--push)
     fi
     ;;
+  publish-on-merge)
+    args=(publish-on-merge --path "$path")
+    if [[ "$dry_run" == "true" ]]; then
+      args+=(--dry-run)
+    fi
+    if [[ "$push" == "true" ]]; then
+      args+=(--push)
+    fi
+    ;;
   *)
     echo "unsupported mode: $mode" >&2
-    echo "valid modes: init | check | plan | release-pr | release | publish" >&2
+    echo "valid modes: init | check | plan | release-pr | release | publish | publish-on-merge" >&2
     exit 2
     ;;
 esac

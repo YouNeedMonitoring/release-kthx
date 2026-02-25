@@ -4,7 +4,7 @@ author: release-kthx
 
 inputs:
   mode:
-    description: "Command to execute: init | check | plan | release-pr | release | publish"
+    description: "Command to execute: init | check | plan | release-pr | release | publish | publish-on-merge"
     required: false
     default: plan
   path:
@@ -23,11 +23,11 @@ inputs:
     required: false
     default: "release-kthx/release-pr"
   dry-run:
-    description: "When mode=release or publish, do not create git tag/release"
+    description: "When mode=release/publish/publish-on-merge, do not create git tag/release"
     required: false
     default: "true"
   push:
-    description: "When mode=release/publish and dry-run=false, push created tag to origin"
+    description: "When mode=release/publish/publish-on-merge and dry-run=false, push created tag to origin"
     required: false
     default: "true"
   force:

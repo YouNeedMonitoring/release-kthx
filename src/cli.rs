@@ -57,4 +57,12 @@ pub enum Command {
         #[arg(long, default_value_t = false)]
         push: bool,
     },
+    PublishOnMerge {
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        #[arg(long, default_value_t = false)]
+        push: bool,
+    },
 }

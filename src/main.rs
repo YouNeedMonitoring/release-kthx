@@ -1,6 +1,7 @@
 mod changelog;
 mod cli;
 mod config;
+mod event;
 mod git;
 mod github;
 mod release;
@@ -50,6 +51,13 @@ fn main() -> Result<()> {
             push,
         } => {
             run_publish(path, dry_run, push)?;
+        }
+        Command::PublishOnMerge {
+            path,
+            dry_run,
+            push,
+        } => {
+            run_publish_on_merge(path, dry_run, push)?;
         }
     }
 
@@ -330,4 +338,24 @@ fn run_publish(path: PathBuf, dry_run: bool, push: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn run_publish_on_merge(path: PathBuf, dry_run: bool, push: bool) -> Result<()> {
+    let Some((before, after)) = event::push_range_from_env()? else {
+        println!("publish-on-merge: skipped (not a push merge payload)");
+        return Ok(());
+    };
+
+    let changed_files = git::changed_files_between(&path, &before, &after)?;
+    if changed_files.is_empty() {
+        println!("publish-on-merge: skipped (no changed files)");
+        return Ok(());
+    }
+
+    if !release::is_release_merge_payload(&changed_files) {
+        println!("publish-on-merge: skipped (changes are not release payload)");
+        return Ok(());
+    }
+
+    run_publish(path, dry_run, push)
 }

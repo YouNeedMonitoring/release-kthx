@@ -119,53 +119,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Detect release-merge payload
-        id: detect
-        shell: bash
-        run: |
-          set -euo pipefail
-          before="${{ github.event.before }}"
-          after="${{ github.sha }}"
-
-          if [[ "$before" == "0000000000000000000000000000000000000000" ]]; then
-            echo "should_publish=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          mapfile -t files < <(git diff --name-only "$before" "$after")
-
-          if [[ ${#files[@]} -eq 0 ]]; then
-            echo "should_publish=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          has_manifest=false
-          for file in "${files[@]}"; do
-            if [[ "$file" =~ (^|/)Cargo.toml$ ]]; then
-              has_manifest=true
-              continue
-            fi
-            if [[ "$file" == "Cargo.lock" ]]; then
-              continue
-            fi
-            echo "non-release file changed: $file"
-            echo "should_publish=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          done
-
-          if [[ "$has_manifest" == true ]]; then
-            echo "should_publish=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "should_publish=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Publish merged release
-        if: steps.detect.outputs.should_publish == 'true'
         uses: ./.
         env:
           GITHUB_TOKEN: ${{ github.token }}
         with:
-          mode: publish
+          mode: publish-on-merge
           path: .
           dry-run: "false"
           push: "true"

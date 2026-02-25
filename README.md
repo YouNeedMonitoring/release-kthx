@@ -58,7 +58,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         with:
-          mode: publish
+          mode: publish-on-merge
           path: .
           dry-run: "false"
           push: "true"
@@ -66,13 +66,13 @@ jobs:
 
 ## Action inputs
 
-- `mode`: `init` | `check` | `plan` | `release-pr` | `release` | `publish` (default `plan`)
+- `mode`: `init` | `check` | `plan` | `release-pr` | `release` | `publish` | `publish-on-merge` (default `plan`)
 - `path`: repository path (default `.`)
 - `from-tag`: optional base tag (`plan` / `release-pr` / `release`)
 - `base-branch`: base branch for `release-pr` (default `main`)
 - `pr-branch`: branch for `release-pr` updates (default `release-kthx/release-pr`)
-- `dry-run`: for `release` and `publish` (default `true`)
-- `push`: for `release` and `publish`; pushes created tag to origin (default `true`)
+- `dry-run`: for `release` / `publish` / `publish-on-merge` (default `true`)
+- `push`: for `release` / `publish` / `publish-on-merge`; pushes created tag to origin (default `true`)
 - `force`: only for `init` (default `false`)
 
 ## Local CLI usage
@@ -84,6 +84,7 @@ cargo run -- plan --path .
 cargo run -- release-pr --path . --base-branch main --pr-branch release-kthx/release-pr
 cargo run -- release --path . --dry-run
 cargo run -- publish --path . --dry-run
+cargo run -- publish-on-merge --path . --dry-run
 ```
 
 ## Config file

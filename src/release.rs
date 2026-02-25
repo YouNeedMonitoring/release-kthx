@@ -1,8 +1,9 @@
 use crate::git::{CliCommitHistoryService, CommitHistoryService};
 use anyhow::{Context, Result, bail};
 pub use release_kthx_domain::{CommitKind, ReleasePlan};
+use release_kthx_domain::{WorkspaceCrate, WorkspaceGraph};
 use semver::Version;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use toml::Value;
@@ -14,6 +15,7 @@ pub struct CrateInfo {
     pub manifest_path: PathBuf,
     pub crate_dir: PathBuf,
     pub version: Version,
+    pub local_dependencies: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +37,7 @@ pub fn collect_crates(path: &Path) -> Result<Vec<CrateInfo>> {
     }
 
     crates.sort_by(|a, b| a.manifest_path.cmp(&b.manifest_path));
+    populate_local_dependencies(path, &mut crates)?;
     Ok(crates)
 }
 
@@ -57,10 +60,15 @@ pub fn build_crate_release_plans_with_history(
     if crates.is_empty() {
         bail!("no Cargo package manifests found");
     }
+    let workspace_graph =
+        WorkspaceGraph::from_crates(crates.iter().map(|crate_info| WorkspaceCrate {
+            name: crate_info.name.clone(),
+            local_dependencies: crate_info.local_dependencies.iter().cloned().collect(),
+        }));
 
     let crate_count = crates.len();
     let mut plans = Vec::new();
-    for (index, crate_info) in crates.iter().enumerate() {
+    for crate_info in crates.iter() {
         let base_ref = resolve_base_reference(
             history,
             path,
@@ -77,7 +85,9 @@ pub fn build_crate_release_plans_with_history(
 
         let mut commit_inputs = Vec::new();
         for commit in raw_commits {
-            if !affected_crates(&crates, &commit.files).contains(&index) {
+            let directly_affected = directly_affected_crates(&crates, &commit.files);
+            let topology = workspace_graph.release_topology(directly_affected.iter());
+            if !topology.includes(&crate_info.name) {
                 continue;
             }
 
@@ -221,6 +231,27 @@ pub fn render_tag_name(
         .replace("{{ version }}", &version.to_string()))
 }
 
+pub fn is_release_merge_payload(files: &[PathBuf]) -> bool {
+    let mut has_manifest = false;
+
+    for file in files {
+        let as_string = file.to_string_lossy();
+
+        if as_string.ends_with("Cargo.toml") {
+            has_manifest = true;
+            continue;
+        }
+
+        if as_string == "Cargo.lock" {
+            continue;
+        }
+
+        return false;
+    }
+
+    has_manifest
+}
+
 fn parse_crate_info(repo_root: &Path, manifest_abs: &Path) -> Result<Option<CrateInfo>> {
     let raw = fs::read_to_string(manifest_abs)
         .with_context(|| format!("failed reading {}", manifest_abs.display()))?;
@@ -261,10 +292,70 @@ fn parse_crate_info(repo_root: &Path, manifest_abs: &Path) -> Result<Option<Crat
         manifest_path,
         crate_dir,
         version,
+        local_dependencies: Vec::new(),
     }))
 }
 
-fn affected_crates(crates: &[CrateInfo], files: &[PathBuf]) -> Vec<usize> {
+fn populate_local_dependencies(repo_root: &Path, crates: &mut [CrateInfo]) -> Result<()> {
+    let crate_names = crates
+        .iter()
+        .map(|crate_info| crate_info.name.clone())
+        .collect::<HashSet<_>>();
+
+    for crate_info in crates.iter_mut() {
+        let manifest_abs = repo_root.join(&crate_info.manifest_path);
+        let raw = fs::read_to_string(&manifest_abs)
+            .with_context(|| format!("failed reading {}", manifest_abs.display()))?;
+        let value = raw
+            .parse::<Value>()
+            .with_context(|| format!("failed parsing {}", manifest_abs.display()))?;
+
+        let mut deps = BTreeSet::new();
+        for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+            if let Some(table) = value.get(section).and_then(Value::as_table) {
+                collect_local_dependency_names(table, &crate_names, &mut deps);
+            }
+        }
+
+        if let Some(targets) = value.get("target").and_then(Value::as_table) {
+            for target in targets.values().filter_map(Value::as_table) {
+                for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+                    if let Some(table) = target.get(section).and_then(Value::as_table) {
+                        collect_local_dependency_names(table, &crate_names, &mut deps);
+                    }
+                }
+            }
+        }
+
+        deps.remove(crate_info.name.as_str());
+        crate_info.local_dependencies = deps.into_iter().collect();
+    }
+
+    Ok(())
+}
+
+fn collect_local_dependency_names(
+    dependency_table: &toml::map::Map<String, Value>,
+    crate_names: &HashSet<String>,
+    result: &mut BTreeSet<String>,
+) {
+    for (key, value) in dependency_table {
+        let crate_name = dependency_crate_name(key, value);
+        if crate_names.contains(crate_name) {
+            result.insert(crate_name.to_string());
+        }
+    }
+}
+
+fn dependency_crate_name<'a>(dependency_key: &'a str, dependency_value: &'a Value) -> &'a str {
+    dependency_value
+        .as_table()
+        .and_then(|table| table.get("package"))
+        .and_then(Value::as_str)
+        .unwrap_or(dependency_key)
+}
+
+fn directly_affected_crates(crates: &[CrateInfo], files: &[PathBuf]) -> Vec<String> {
     let mut affected = HashSet::new();
 
     for file in files {
@@ -288,12 +379,12 @@ fn affected_crates(crates: &[CrateInfo], files: &[PathBuf]) -> Vec<usize> {
         }
 
         if let Some((index, _)) = winner {
-            affected.insert(index);
+            affected.insert(crates[index].name.clone());
         }
     }
 
     let mut ordered = affected.into_iter().collect::<Vec<_>>();
-    ordered.sort_unstable();
+    ordered.sort();
     ordered
 }
 
@@ -455,5 +546,62 @@ mod tests {
         let updated = fs::read_to_string(&lock_path).expect("read updated lock");
         assert!(updated.contains("name = \"release-kthx\"\nversion = \"0.1.1\""));
         assert!(updated.contains("name = \"release-kthx-domain\"\nversion = \"0.2.0\""));
+    }
+
+    #[test]
+    fn release_payload_accepts_manifest_and_lockfile() {
+        let files = vec![
+            PathBuf::from("Cargo.toml"),
+            PathBuf::from("Cargo.lock"),
+            PathBuf::from("crates/release-kthx-domain/Cargo.toml"),
+        ];
+        assert!(is_release_merge_payload(&files));
+    }
+
+    #[test]
+    fn release_payload_rejects_non_release_files() {
+        let files = vec![PathBuf::from("Cargo.toml"), PathBuf::from("README.md")];
+        assert!(!is_release_merge_payload(&files));
+    }
+
+    #[test]
+    fn collect_crates_populates_local_dependencies() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+
+        fs::create_dir_all(root.join("crates/app/src")).expect("create app dirs");
+        fs::create_dir_all(root.join("crates/domain/src")).expect("create domain dirs");
+
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/app\", \"crates/domain\"]\n",
+        )
+        .expect("write workspace manifest");
+
+        fs::write(
+            root.join("crates/domain/Cargo.toml"),
+            "[package]\nname = \"domain\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+        )
+        .expect("write domain manifest");
+
+        fs::write(
+            root.join("crates/app/Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\ndomain = { path = \"../domain\", version = \"0.1.0\" }\nserde = \"1\"\n",
+        )
+        .expect("write app manifest");
+
+        let crates = collect_crates(root).expect("collect crates");
+
+        let app = crates
+            .iter()
+            .find(|crate_info| crate_info.name == "app")
+            .expect("app crate");
+        assert_eq!(app.local_dependencies, vec!["domain"]);
+
+        let domain = crates
+            .iter()
+            .find(|crate_info| crate_info.name == "domain")
+            .expect("domain crate");
+        assert!(domain.local_dependencies.is_empty());
     }
 }
