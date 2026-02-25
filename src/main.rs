@@ -65,7 +65,8 @@ fn load_config(path: &Path) -> Result<ReleaseKthxConfig> {
 
 fn run_plan(path: PathBuf, from_tag: Option<String>) -> Result<()> {
     let cfg = load_config(&path)?;
-    let plans = release::build_crate_release_plans(&path, from_tag.as_deref())?;
+    let plans =
+        release::build_crate_release_plans(&path, from_tag.as_deref(), &cfg.release.tag_template)?;
     if plans.is_empty() {
         println!("no releasable changes detected");
         return Ok(());
@@ -103,7 +104,8 @@ fn run_release_pr(
     pr_branch: &str,
 ) -> Result<()> {
     let cfg = load_config(&path)?;
-    let plans = release::build_crate_release_plans(&path, from_tag.as_deref())?;
+    let plans =
+        release::build_crate_release_plans(&path, from_tag.as_deref(), &cfg.release.tag_template)?;
     if plans.is_empty() {
         println!("no releasable changes detected; skipping release PR");
         return Ok(());
@@ -194,7 +196,8 @@ fn release_pr_body(plans: &[release::CrateReleasePlan], changed_manifests: &[Pat
 
 fn run_release(path: PathBuf, from_tag: Option<String>, dry_run: bool, push: bool) -> Result<()> {
     let cfg = load_config(&path)?;
-    let plans = release::build_crate_release_plans(&path, from_tag.as_deref())?;
+    let plans =
+        release::build_crate_release_plans(&path, from_tag.as_deref(), &cfg.release.tag_template)?;
     if plans.is_empty() {
         println!("no releasable changes detected");
         return Ok(());

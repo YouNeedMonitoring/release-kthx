@@ -41,50 +41,56 @@ pub fn collect_crates(path: &Path) -> Result<Vec<CrateInfo>> {
 pub fn build_crate_release_plans(
     path: &Path,
     from_tag: Option<&str>,
+    tag_template: &str,
 ) -> Result<Vec<CrateReleasePlan>> {
     let history = CliCommitHistoryService;
-    build_crate_release_plans_with_history(&history, path, from_tag)
+    build_crate_release_plans_with_history(&history, path, from_tag, tag_template)
 }
 
 pub fn build_crate_release_plans_with_history(
     history: &impl CommitHistoryService,
     path: &Path,
     from_tag: Option<&str>,
+    tag_template: &str,
 ) -> Result<Vec<CrateReleasePlan>> {
     let crates = collect_crates(path)?;
     if crates.is_empty() {
         bail!("no Cargo package manifests found");
     }
 
-    let base_tag = if let Some(explicit) = from_tag {
-        Some(explicit.to_string())
-    } else {
-        history.latest_tag(path)?
-    };
-
-    let raw_commits = history.collect_commits(path, base_tag.as_deref())?;
-    if raw_commits.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut commits_by_crate = vec![Vec::<release_kthx_domain::CommitInput>::new(); crates.len()];
-    for commit in raw_commits {
-        let affected = affected_crates(&crates, &commit.files);
-        for index in affected {
-            commits_by_crate[index].push(release_kthx_domain::CommitInput {
-                hash: commit.hash.clone(),
-                subject: commit.subject.clone(),
-                body: commit.body.clone(),
-            });
-        }
-    }
-
+    let crate_count = crates.len();
     let mut plans = Vec::new();
     for (index, crate_info) in crates.iter().enumerate() {
-        let commit_inputs = std::mem::take(&mut commits_by_crate[index]);
+        let base_ref = resolve_base_reference(
+            history,
+            path,
+            from_tag,
+            tag_template,
+            crate_info,
+            crate_count,
+        )?;
+
+        let raw_commits = history.collect_commits(path, base_ref.as_deref())?;
+        if raw_commits.is_empty() {
+            continue;
+        }
+
+        let mut commit_inputs = Vec::new();
+        for commit in raw_commits {
+            if !affected_crates(&crates, &commit.files).contains(&index) {
+                continue;
+            }
+
+            commit_inputs.push(release_kthx_domain::CommitInput {
+                hash: commit.hash,
+                subject: commit.subject,
+                body: commit.body,
+            });
+        }
+
         let Some(plan) = release_kthx_domain::plan_release(
             crate_info.version.clone(),
-            base_tag.clone(),
+            base_ref.clone(),
             commit_inputs,
         ) else {
             continue;
@@ -99,6 +105,37 @@ pub fn build_crate_release_plans_with_history(
 
     plans.sort_by(|a, b| a.manifest_path.cmp(&b.manifest_path));
     Ok(plans)
+}
+
+fn resolve_base_reference(
+    history: &impl CommitHistoryService,
+    path: &Path,
+    from_tag: Option<&str>,
+    tag_template: &str,
+    crate_info: &CrateInfo,
+    crate_count: usize,
+) -> Result<Option<String>> {
+    if let Some(explicit) = from_tag {
+        return Ok(Some(explicit.to_string()));
+    }
+
+    let expected_tag = render_tag_name(
+        tag_template,
+        &crate_info.name,
+        &crate_info.version,
+        crate_count,
+    )?;
+
+    if history.tag_exists(path, &expected_tag)? {
+        return Ok(Some(expected_tag));
+    }
+
+    let version = crate_info.version.to_string();
+    if let Some(commit) = history.find_version_commit(path, &crate_info.manifest_path, &version)? {
+        return Ok(Some(commit));
+    }
+
+    history.latest_tag(path)
 }
 
 pub fn set_crate_versions(path: &Path, plans: &[CrateReleasePlan]) -> Result<Vec<PathBuf>> {

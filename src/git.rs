@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -13,6 +13,13 @@ pub struct CommitRecord {
 pub trait CommitHistoryService {
     fn latest_tag(&self, path: &Path) -> Result<Option<String>>;
     fn collect_commits(&self, path: &Path, from_tag: Option<&str>) -> Result<Vec<CommitRecord>>;
+    fn tag_exists(&self, path: &Path, tag_name: &str) -> Result<bool>;
+    fn find_version_commit(
+        &self,
+        path: &Path,
+        manifest_path: &Path,
+        version: &str,
+    ) -> Result<Option<String>>;
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -25,6 +32,19 @@ impl CommitHistoryService for CliCommitHistoryService {
 
     fn collect_commits(&self, path: &Path, from_tag: Option<&str>) -> Result<Vec<CommitRecord>> {
         collect_commits(path, from_tag)
+    }
+
+    fn tag_exists(&self, path: &Path, tag_name: &str) -> Result<bool> {
+        tag_exists(path, tag_name)
+    }
+
+    fn find_version_commit(
+        &self,
+        path: &Path,
+        manifest_path: &Path,
+        version: &str,
+    ) -> Result<Option<String>> {
+        find_version_commit(path, manifest_path, version)
     }
 }
 
@@ -95,6 +115,35 @@ pub fn latest_tag(path: &Path) -> Result<Option<String>> {
         Ok(None)
     } else {
         Ok(Some(tag))
+    }
+}
+
+pub fn find_version_commit(
+    path: &Path,
+    manifest_path: &Path,
+    version: &str,
+) -> Result<Option<String>> {
+    let needle = format!("version = \"{version}\"");
+    let args = vec![
+        "log".to_string(),
+        "--pretty=format:%H".to_string(),
+        "-S".to_string(),
+        needle,
+        "--".to_string(),
+        manifest_path.to_string_lossy().to_string(),
+    ];
+
+    let raw = run_git_owned(path, &args)?;
+    let hash = raw
+        .lines()
+        .next()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    if hash.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(hash))
     }
 }
 
@@ -394,10 +443,9 @@ mod tests {
             .find(|c| c.subject == "fix: patch parser")
             .expect("fix commit exists");
         assert!(fix.files.contains(&PathBuf::from("README.md")));
-        assert!(
-            fix.files
-                .contains(&PathBuf::from("crates/release-kthx-domain/src/lib.rs"))
-        );
+        assert!(fix
+            .files
+            .contains(&PathBuf::from("crates/release-kthx-domain/src/lib.rs")));
 
         let feat = commits
             .iter()
