@@ -11,15 +11,32 @@ pub struct ReleaseKthxConfig {
     pub github: GithubConfig,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum InternalDependencyPolicy {
+    Auto,
+    Strip,
+    Update,
+}
+
+impl Default for InternalDependencyPolicy {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ReleaseConfig {
     pub tag_template: String,
+    #[serde(default)]
+    pub internal_dependency_policy: InternalDependencyPolicy,
 }
 
 impl Default for ReleaseConfig {
     fn default() -> Self {
         Self {
             tag_template: "{{ crate }}-v{{ version }}".to_string(),
+            internal_dependency_policy: InternalDependencyPolicy::Auto,
         }
     }
 }
@@ -97,5 +114,14 @@ mod tests {
         let mut cfg = ReleaseKthxConfig::default();
         cfg.release.tag_template = "release".to_string();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn default_policy_is_auto() {
+        let cfg = ReleaseKthxConfig::default();
+        assert_eq!(
+            cfg.release.internal_dependency_policy,
+            InternalDependencyPolicy::Auto
+        );
     }
 }

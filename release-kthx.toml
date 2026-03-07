@@ -1,5 +1,6 @@
 [release]
 tag_template = "{{ crate }}-v{{ version }}"
+internal_dependency_policy = "auto"
 
 [github]
 create_release = true

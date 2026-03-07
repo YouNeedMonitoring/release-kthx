@@ -1,13 +1,14 @@
+use crate::config::InternalDependencyPolicy;
 use crate::git::{CliCommitHistoryService, CommitHistoryService};
 use anyhow::{Context, Result, bail};
 pub use release_kthx_domain::{CommitKind, ReleasePlan};
 use release_kthx_domain::{WorkspaceCrate, WorkspaceGraph};
-use semver::Version;
-use std::collections::{BTreeSet, HashSet};
+use semver::{Version, VersionReq};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use toml::Value;
-use toml_edit::{DocumentMut, Item, value};
+use toml_edit::{DocumentMut, Item, TableLike, value};
 
 #[derive(Debug, Clone)]
 pub struct CrateInfo {
@@ -15,6 +16,7 @@ pub struct CrateInfo {
     pub manifest_path: PathBuf,
     pub crate_dir: PathBuf,
     pub version: Version,
+    pub private: bool,
     pub local_dependencies: Vec<String>,
 }
 
@@ -23,6 +25,15 @@ pub struct CrateReleasePlan {
     pub crate_name: String,
     pub manifest_path: PathBuf,
     pub plan: ReleasePlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InternalDependencyEdit {
+    pub manifest_path: PathBuf,
+    pub dependency_key: String,
+    pub dependency_name: String,
+    pub old_requirement: Option<String>,
+    pub new_requirement: Option<String>,
 }
 
 pub fn collect_crates(path: &Path) -> Result<Vec<CrateInfo>> {
@@ -161,6 +172,34 @@ pub fn set_crate_versions(path: &Path, plans: &[CrateReleasePlan]) -> Result<Vec
     Ok(changed)
 }
 
+pub fn set_internal_dependency_requirements(
+    path: &Path,
+    policy: InternalDependencyPolicy,
+    plans: &[CrateReleasePlan],
+) -> Result<Vec<PathBuf>> {
+    let crates = collect_crates(path)?;
+    let desired_versions = desired_versions_by_crate(&crates, plans);
+    let edits =
+        rewrite_internal_dependency_requirements(path, &crates, &desired_versions, policy, true)?;
+
+    let mut changed = edits
+        .into_iter()
+        .map(|edit| edit.manifest_path)
+        .collect::<Vec<_>>();
+    changed.sort();
+    changed.dedup();
+    Ok(changed)
+}
+
+pub fn internal_dependency_drifts(
+    path: &Path,
+    policy: InternalDependencyPolicy,
+) -> Result<Vec<InternalDependencyEdit>> {
+    let crates = collect_crates(path)?;
+    let desired_versions = desired_versions_by_crate(&crates, &[]);
+    rewrite_internal_dependency_requirements(path, &crates, &desired_versions, policy, false)
+}
+
 pub fn set_lockfile_versions(path: &Path, plans: &[CrateReleasePlan]) -> Result<bool> {
     let lock_path = path.join("Cargo.lock");
     if !lock_path.exists() {
@@ -214,6 +253,329 @@ pub fn set_lockfile_versions(path: &Path, plans: &[CrateReleasePlan]) -> Result<
     fs::write(&lock_path, rendered)
         .with_context(|| format!("failed writing {}", lock_path.display()))?;
     Ok(true)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DependencyRewriteScope<'a> {
+    Member { dependent: Option<&'a CrateInfo> },
+    WorkspaceDependencies,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum VersionPrecision {
+    Major,
+    Minor,
+    Patch,
+}
+
+fn desired_versions_by_crate(
+    crates: &[CrateInfo],
+    plans: &[CrateReleasePlan],
+) -> BTreeMap<String, Version> {
+    let mut desired = crates
+        .iter()
+        .map(|crate_info| (crate_info.name.clone(), crate_info.version.clone()))
+        .collect::<BTreeMap<_, _>>();
+
+    for plan in plans {
+        desired.insert(plan.crate_name.clone(), plan.plan.next_version.clone());
+    }
+
+    desired
+}
+
+fn rewrite_internal_dependency_requirements(
+    path: &Path,
+    crates: &[CrateInfo],
+    desired_versions: &BTreeMap<String, Version>,
+    policy: InternalDependencyPolicy,
+    write_changes: bool,
+) -> Result<Vec<InternalDependencyEdit>> {
+    let crates_by_name = crates
+        .iter()
+        .map(|crate_info| (crate_info.name.clone(), crate_info))
+        .collect::<BTreeMap<_, _>>();
+    let all_private = crates.iter().all(|crate_info| crate_info.private);
+
+    let mut manifests = crates
+        .iter()
+        .map(|crate_info| crate_info.manifest_path.clone())
+        .collect::<Vec<_>>();
+    let root_manifest = PathBuf::from("Cargo.toml");
+    if path.join(&root_manifest).exists() {
+        manifests.push(root_manifest);
+    }
+    manifests.sort();
+    manifests.dedup();
+
+    let mut edits = Vec::new();
+    for manifest_path in manifests {
+        let manifest_abs = path.join(&manifest_path);
+        let original = fs::read_to_string(&manifest_abs)
+            .with_context(|| format!("failed reading {}", manifest_abs.display()))?;
+        let mut doc = original
+            .parse::<DocumentMut>()
+            .with_context(|| format!("failed parsing {}", manifest_abs.display()))?;
+
+        let dependent_name = manifest_package_name(&doc).map(str::to_string);
+        let dependent = dependent_name
+            .as_deref()
+            .and_then(|name| crates_by_name.get(name).copied());
+
+        let mut manifest_edits = Vec::new();
+
+        for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+            if let Some(item) = doc.get_mut(section)
+                && let Some(table) = item.as_table_like_mut()
+            {
+                rewrite_dependency_table(
+                    table,
+                    &manifest_path,
+                    DependencyRewriteScope::Member { dependent },
+                    &crates_by_name,
+                    desired_versions,
+                    policy,
+                    all_private,
+                    &mut manifest_edits,
+                )?;
+            }
+        }
+
+        if let Some(targets) = doc.get_mut("target")
+            && let Some(targets_table) = targets.as_table_like_mut()
+        {
+            for (_, target_item) in targets_table.iter_mut() {
+                let Some(target_table) = target_item.as_table_like_mut() else {
+                    continue;
+                };
+
+                for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+                    if let Some(item) = target_table.get_mut(section)
+                        && let Some(table) = item.as_table_like_mut()
+                    {
+                        rewrite_dependency_table(
+                            table,
+                            &manifest_path,
+                            DependencyRewriteScope::Member { dependent },
+                            &crates_by_name,
+                            desired_versions,
+                            policy,
+                            all_private,
+                            &mut manifest_edits,
+                        )?;
+                    }
+                }
+            }
+        }
+
+        if let Some(workspace) = doc.get_mut("workspace")
+            && let Some(workspace_table) = workspace.as_table_like_mut()
+            && let Some(item) = workspace_table.get_mut("dependencies")
+            && let Some(table) = item.as_table_like_mut()
+        {
+            rewrite_dependency_table(
+                table,
+                &manifest_path,
+                DependencyRewriteScope::WorkspaceDependencies,
+                &crates_by_name,
+                desired_versions,
+                policy,
+                all_private,
+                &mut manifest_edits,
+            )?;
+        }
+
+        if manifest_edits.is_empty() {
+            continue;
+        }
+
+        let rendered = doc.to_string();
+        if rendered == original {
+            continue;
+        }
+
+        if write_changes {
+            fs::write(&manifest_abs, rendered)
+                .with_context(|| format!("failed writing {}", manifest_abs.display()))?;
+        }
+
+        edits.extend(manifest_edits);
+    }
+
+    edits.sort_by(|a, b| {
+        a.manifest_path
+            .cmp(&b.manifest_path)
+            .then(a.dependency_key.cmp(&b.dependency_key))
+            .then(a.dependency_name.cmp(&b.dependency_name))
+    });
+    Ok(edits)
+}
+
+fn manifest_package_name(doc: &DocumentMut) -> Option<&str> {
+    doc.get("package")
+        .and_then(Item::as_table_like)
+        .and_then(|table| table.get("name"))
+        .and_then(Item::as_str)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rewrite_dependency_table(
+    table: &mut dyn TableLike,
+    manifest_path: &Path,
+    scope: DependencyRewriteScope<'_>,
+    crates_by_name: &BTreeMap<String, &CrateInfo>,
+    desired_versions: &BTreeMap<String, Version>,
+    policy: InternalDependencyPolicy,
+    all_private: bool,
+    edits: &mut Vec<InternalDependencyEdit>,
+) -> Result<()> {
+    for (key, item) in table.iter_mut() {
+        let dependency_key = key.get().to_string();
+        let Some(dependency_table) = item.as_table_like_mut() else {
+            continue;
+        };
+
+        let dependency_name = dependency_table
+            .get("package")
+            .and_then(Item::as_str)
+            .unwrap_or(dependency_key.as_str())
+            .to_string();
+        let Some(dependency_crate) = crates_by_name.get(&dependency_name).copied() else {
+            continue;
+        };
+        if !dependency_declares_internal_source(dependency_table) {
+            continue;
+        }
+
+        let current_requirement = dependency_table
+            .get("version")
+            .and_then(Item::as_str)
+            .map(str::to_string);
+        let next_requirement = desired_internal_dependency_requirement(
+            policy,
+            scope,
+            dependency_crate,
+            all_private,
+            current_requirement.as_deref(),
+            desired_versions
+                .get(&dependency_name)
+                .with_context(|| format!("missing desired version for {dependency_name}"))?,
+        )?;
+
+        if current_requirement == next_requirement {
+            continue;
+        }
+
+        apply_dependency_requirement(dependency_table, next_requirement.clone());
+        edits.push(InternalDependencyEdit {
+            manifest_path: manifest_path.to_path_buf(),
+            dependency_key,
+            dependency_name,
+            old_requirement: current_requirement,
+            new_requirement: next_requirement,
+        });
+    }
+
+    Ok(())
+}
+
+fn dependency_declares_internal_source(table: &dyn TableLike) -> bool {
+    table.contains_key("path")
+        || matches!(table.get("workspace").and_then(Item::as_bool), Some(true))
+}
+
+fn desired_internal_dependency_requirement(
+    policy: InternalDependencyPolicy,
+    scope: DependencyRewriteScope<'_>,
+    dependency_crate: &CrateInfo,
+    all_private: bool,
+    current_requirement: Option<&str>,
+    next_version: &Version,
+) -> Result<Option<String>> {
+    let should_strip = match scope {
+        DependencyRewriteScope::Member {
+            dependent: Some(dependent),
+        } => dependent.private && dependency_crate.private,
+        DependencyRewriteScope::WorkspaceDependencies => all_private && dependency_crate.private,
+        DependencyRewriteScope::Member { dependent: None } => false,
+    };
+
+    match policy {
+        InternalDependencyPolicy::Strip => Ok(None),
+        InternalDependencyPolicy::Update => Ok(Some(upgrade_dependency_requirement(
+            current_requirement,
+            next_version,
+        )?)),
+        InternalDependencyPolicy::Auto if should_strip => Ok(None),
+        InternalDependencyPolicy::Auto => current_requirement
+            .map(|requirement| upgrade_dependency_requirement(Some(requirement), next_version))
+            .transpose(),
+    }
+}
+
+fn apply_dependency_requirement(table: &mut dyn TableLike, requirement: Option<String>) {
+    match requirement {
+        Some(requirement) => {
+            table.insert("version", value(requirement));
+        }
+        None => {
+            table.remove("version");
+        }
+    }
+}
+
+fn upgrade_dependency_requirement(
+    current_requirement: Option<&str>,
+    next_version: &Version,
+) -> Result<String> {
+    let Some(current_requirement) = current_requirement.map(str::trim) else {
+        return Ok(next_version.to_string());
+    };
+    if current_requirement.is_empty() {
+        return Ok(next_version.to_string());
+    }
+
+    let parsed = VersionReq::parse(current_requirement).with_context(|| {
+        format!("unsupported internal dependency version requirement `{current_requirement}`")
+    })?;
+    if parsed.comparators.len() != 1 {
+        bail!("unsupported internal dependency version requirement `{current_requirement}`");
+    }
+
+    let comparator = &parsed.comparators[0];
+    let precision = if comparator.patch.is_some() {
+        VersionPrecision::Patch
+    } else if comparator.minor.is_some() {
+        VersionPrecision::Minor
+    } else {
+        VersionPrecision::Major
+    };
+
+    let (prefix, _) = split_requirement_prefix(current_requirement);
+    Ok(format!(
+        "{}{}",
+        prefix,
+        format_version_with_precision(next_version, precision)
+    ))
+}
+
+fn split_requirement_prefix(requirement: &str) -> (&str, &str) {
+    let trimmed = requirement.trim();
+    for prefix in [">=", "<=", "^", "~", "=", ">", "<"] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return (prefix, rest.trim_start());
+        }
+    }
+
+    ("", trimmed)
+}
+
+fn format_version_with_precision(version: &Version, precision: VersionPrecision) -> String {
+    match precision {
+        VersionPrecision::Major => version.major.to_string(),
+        VersionPrecision::Minor => format!("{}.{}", version.major, version.minor),
+        VersionPrecision::Patch => version.to_string(),
+    }
 }
 
 pub fn render_tag_name(
@@ -271,6 +633,7 @@ fn parse_crate_info(repo_root: &Path, manifest_abs: &Path) -> Result<Option<Crat
 
     let version = Version::parse(version_str)
         .with_context(|| format!("invalid semver version in {}", manifest_abs.display()))?;
+    let private = matches!(package.get("publish").and_then(Value::as_bool), Some(false));
 
     let manifest_path = manifest_abs
         .strip_prefix(repo_root)
@@ -292,6 +655,7 @@ fn parse_crate_info(repo_root: &Path, manifest_abs: &Path) -> Result<Option<Crat
         manifest_path,
         crate_dir,
         version,
+        private,
         local_dependencies: Vec::new(),
     }))
 }
@@ -487,6 +851,7 @@ fn set_table_item_version(item: &mut Item, next_version: &Version) -> Result<boo
 mod tests {
     use super::*;
     use release_kthx_domain::BumpLevel;
+    use std::path::Path;
 
     fn test_plan(crate_name: &str, current: &str, next: &str) -> CrateReleasePlan {
         CrateReleasePlan {
@@ -500,6 +865,27 @@ mod tests {
                 commits: Vec::new(),
             },
         }
+    }
+
+    fn write_crate(
+        root: &Path,
+        relative: &str,
+        name: &str,
+        version: &str,
+        private: bool,
+        extra: &str,
+    ) {
+        let manifest_dir = root.join(relative);
+        fs::create_dir_all(manifest_dir.join("src")).expect("create crate dirs");
+
+        let publish = if private { "publish = false\n" } else { "" };
+        fs::write(
+            manifest_dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{name}\"\n{publish}version = \"{version}\"\nedition = \"2024\"\n\n{extra}",
+            ),
+        )
+        .expect("write crate manifest");
     }
 
     #[test]
@@ -603,5 +989,151 @@ mod tests {
             .find(|crate_info| crate_info.name == "domain")
             .expect("domain crate");
         assert!(domain.local_dependencies.is_empty());
+    }
+
+    #[test]
+    fn upgrade_dependency_requirement_preserves_style() {
+        let next = Version::parse("0.5.1").expect("valid semver");
+        assert_eq!(
+            upgrade_dependency_requirement(Some("0.4.0"), &next).expect("upgrade"),
+            "0.5.1"
+        );
+        assert_eq!(
+            upgrade_dependency_requirement(Some("^0.4"), &next).expect("upgrade"),
+            "^0.5"
+        );
+        assert_eq!(
+            upgrade_dependency_requirement(Some("=0.4.0"), &next).expect("upgrade"),
+            "=0.5.1"
+        );
+    }
+
+    #[test]
+    fn auto_policy_strips_private_internal_dependency_versions() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/app\", \"crates/domain\"]\n",
+        )
+        .expect("write workspace manifest");
+        write_crate(root, "crates/domain", "domain", "0.4.0", true, "");
+        write_crate(
+            root,
+            "crates/app",
+            "app",
+            "0.1.0",
+            true,
+            "[dependencies]\ndomain = { path = \"../domain\", version = \"0.4.0\", features = [\"serde\"] }\n",
+        );
+
+        let drifts = internal_dependency_drifts(root, InternalDependencyPolicy::Auto)
+            .expect("detect drifts");
+        assert_eq!(drifts.len(), 1);
+        assert_eq!(drifts[0].new_requirement, None);
+
+        let changed = set_internal_dependency_requirements(
+            root,
+            InternalDependencyPolicy::Auto,
+            &[test_plan("domain", "0.4.0", "0.5.0")],
+        )
+        .expect("rewrite internal deps");
+        assert_eq!(changed, vec![PathBuf::from("crates/app/Cargo.toml")]);
+
+        let updated = fs::read_to_string(root.join("crates/app/Cargo.toml")).expect("read app");
+        assert!(updated.contains("path = \"../domain\""));
+        assert!(updated.contains("features = [\"serde\"]"));
+        assert!(!updated.contains("version = \"0.4.0\""));
+        assert!(!updated.contains("version = \"0.5.0\""));
+    }
+
+    #[test]
+    fn auto_policy_updates_non_private_internal_dependency_versions() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/app\", \"crates/domain\"]\n",
+        )
+        .expect("write workspace manifest");
+        write_crate(root, "crates/domain", "domain", "0.4.0", false, "");
+        write_crate(
+            root,
+            "crates/app",
+            "app",
+            "0.1.0",
+            true,
+            "[dependencies]\ndomain = { path = \"../domain\", version = \"^0.4.0\" }\n",
+        );
+
+        let changed = set_internal_dependency_requirements(
+            root,
+            InternalDependencyPolicy::Auto,
+            &[test_plan("domain", "0.4.0", "0.5.0")],
+        )
+        .expect("rewrite internal deps");
+        assert_eq!(changed, vec![PathBuf::from("crates/app/Cargo.toml")]);
+
+        let updated = fs::read_to_string(root.join("crates/app/Cargo.toml")).expect("read app");
+        assert!(updated.contains("version = \"^0.5.0\""));
+    }
+
+    #[test]
+    fn auto_policy_rewrites_workspace_dependency_versions() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/app\", \"crates/domain\"]\n\n[workspace.dependencies]\ndomain = { path = \"crates/domain\", version = \"0.4.0\" }\n",
+        )
+        .expect("write workspace manifest");
+        write_crate(root, "crates/domain", "domain", "0.4.0", true, "");
+        write_crate(
+            root,
+            "crates/app",
+            "app",
+            "0.1.0",
+            true,
+            "[dependencies]\ndomain = { workspace = true }\n",
+        );
+
+        let changed = set_internal_dependency_requirements(
+            root,
+            InternalDependencyPolicy::Auto,
+            &[test_plan("domain", "0.4.0", "0.5.0")],
+        )
+        .expect("rewrite workspace dependencies");
+        assert_eq!(changed, vec![PathBuf::from("Cargo.toml")]);
+
+        let updated = fs::read_to_string(root.join("Cargo.toml")).expect("read root manifest");
+        assert!(!updated.contains("version = \"0.4.0\""));
+    }
+
+    #[test]
+    fn auto_policy_preserves_missing_version_fields_for_non_private_edges() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/app\", \"crates/domain\"]\n",
+        )
+        .expect("write workspace manifest");
+        write_crate(root, "crates/domain", "domain", "0.4.0", false, "");
+        write_crate(
+            root,
+            "crates/app",
+            "app",
+            "0.1.0",
+            false,
+            "[dependencies]\ndomain = { path = \"../domain\" }\n",
+        );
+
+        let drifts = internal_dependency_drifts(root, InternalDependencyPolicy::Auto)
+            .expect("detect drifts");
+        assert!(drifts.is_empty());
     }
 }

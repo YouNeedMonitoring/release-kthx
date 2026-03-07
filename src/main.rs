@@ -24,7 +24,30 @@ fn main() -> Result<()> {
         Command::Check { path } => {
             let cfg = load_config(&path)?;
             cfg.validate()?;
-            println!("config valid: {}", path.join("release-kthx.toml").display());
+
+            let drifts =
+                release::internal_dependency_drifts(&path, cfg.release.internal_dependency_policy)?;
+            if drifts.is_empty() {
+                println!(
+                    "config valid and internal dependencies consistent: {}",
+                    path.join("release-kthx.toml").display()
+                );
+            } else {
+                println!("internal dependency drift detected:");
+                for drift in &drifts {
+                    let before = drift.old_requirement.as_deref().unwrap_or("<none>");
+                    let after = drift.new_requirement.as_deref().unwrap_or("<removed>");
+                    println!(
+                        "- {}: {} ({}) {} -> {}",
+                        drift.manifest_path.display(),
+                        drift.dependency_key,
+                        drift.dependency_name,
+                        before,
+                        after
+                    );
+                }
+                bail!("internal dependency manifests require updates");
+            }
         }
         Command::Plan { path, from_tag } => {
             run_plan(path, from_tag)?;
@@ -122,6 +145,11 @@ fn run_release_pr(
     git::checkout_new_branch(&path, pr_branch)?;
 
     let mut changed_manifests = release::set_crate_versions(&path, &plans)?;
+    changed_manifests.extend(release::set_internal_dependency_requirements(
+        &path,
+        cfg.release.internal_dependency_policy.clone(),
+        &plans,
+    )?);
     if release::set_lockfile_versions(&path, &plans)? {
         changed_manifests.push(PathBuf::from("Cargo.lock"));
     }
