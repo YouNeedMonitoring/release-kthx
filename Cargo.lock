@@ -304,6 +304,7 @@ name = "release-kthx-domain"
 version = "0.1.2"
 dependencies = [
  "semver",
+ "serde",
 ]
 
 [[package]]

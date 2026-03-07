@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use release_kthx_domain::InternalDependencyPolicy;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -14,12 +15,15 @@ pub struct ReleaseKthxConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ReleaseConfig {
     pub tag_template: String,
+    #[serde(default)]
+    pub internal_dependency_policy: InternalDependencyPolicy,
 }
 
 impl Default for ReleaseConfig {
     fn default() -> Self {
         Self {
             tag_template: "{{ crate }}-v{{ version }}".to_string(),
+            internal_dependency_policy: InternalDependencyPolicy::Auto,
         }
     }
 }
@@ -97,5 +101,14 @@ mod tests {
         let mut cfg = ReleaseKthxConfig::default();
         cfg.release.tag_template = "release".to_string();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn default_policy_is_auto() {
+        let cfg = ReleaseKthxConfig::default();
+        assert_eq!(
+            cfg.release.internal_dependency_policy,
+            InternalDependencyPolicy::Auto
+        );
     }
 }
