@@ -551,7 +551,7 @@ fn upgrade_dependency_requirement(
         VersionPrecision::Major
     };
 
-    let (prefix, _) = split_requirement_prefix(current_requirement);
+    let prefix = requirement_prefix(current_requirement).unwrap_or_default();
     Ok(format!(
         "{}{}",
         prefix,
@@ -559,15 +559,11 @@ fn upgrade_dependency_requirement(
     ))
 }
 
-fn split_requirement_prefix(requirement: &str) -> (&str, &str) {
+fn requirement_prefix(requirement: &str) -> Option<&'static str> {
     let trimmed = requirement.trim();
-    for prefix in [">=", "<=", "^", "~", "=", ">", "<"] {
-        if let Some(rest) = trimmed.strip_prefix(prefix) {
-            return (prefix, rest.trim_start());
-        }
-    }
-
-    ("", trimmed)
+    [">=", "<=", "^", "~", "=", ">", "<"]
+        .into_iter()
+        .find(|prefix| trimmed.starts_with(prefix))
 }
 
 fn format_version_with_precision(version: &Version, precision: VersionPrecision) -> String {
