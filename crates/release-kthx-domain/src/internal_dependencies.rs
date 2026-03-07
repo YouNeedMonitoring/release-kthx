@@ -38,8 +38,15 @@ pub enum DependencyOwner {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependencySource {
+    Path,
+    Workspace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InternalDependencyContext {
     pub owner: DependencyOwner,
+    pub source: DependencySource,
     pub dependency_publication: Publication,
     pub all_members_private: bool,
 }
@@ -100,7 +107,10 @@ pub fn desired_requirement_style(
 ) -> Option<RequirementStyle> {
     match policy {
         InternalDependencyPolicy::Strip => None,
-        InternalDependencyPolicy::Update => Some(current_style.unwrap_or_default()),
+        InternalDependencyPolicy::Update => current_style.or_else(|| match context.source {
+            DependencySource::Path => Some(RequirementStyle::default()),
+            DependencySource::Workspace => None,
+        }),
         InternalDependencyPolicy::Auto if context.should_strip_when_auto() => None,
         InternalDependencyPolicy::Auto => current_style,
     }
@@ -218,6 +228,7 @@ mod tests {
             owner: DependencyOwner::Member {
                 publication: Publication::Private,
             },
+            source: DependencySource::Path,
             dependency_publication: Publication::Private,
             all_members_private: true,
         };
@@ -238,6 +249,7 @@ mod tests {
             owner: DependencyOwner::Member {
                 publication: Publication::Publishable,
             },
+            source: DependencySource::Path,
             dependency_publication: Publication::Private,
             all_members_private: false,
         };
@@ -250,9 +262,50 @@ mod tests {
     }
 
     #[test]
+    fn auto_policy_strips_private_workspace_dependencies_when_all_members_are_private() {
+        let context = InternalDependencyContext {
+            owner: DependencyOwner::Workspace,
+            source: DependencySource::Path,
+            dependency_publication: Publication::Private,
+            all_members_private: true,
+        };
+
+        assert_eq!(
+            desired_requirement_style(
+                InternalDependencyPolicy::Auto,
+                context,
+                Some(RequirementStyle::parse("0.4.0").expect("parse style")),
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn strip_policy_removes_style_even_for_publishable_edges() {
+        let context = InternalDependencyContext {
+            owner: DependencyOwner::Member {
+                publication: Publication::Publishable,
+            },
+            source: DependencySource::Path,
+            dependency_publication: Publication::Publishable,
+            all_members_private: false,
+        };
+
+        assert_eq!(
+            desired_requirement_style(
+                InternalDependencyPolicy::Strip,
+                context,
+                Some(RequirementStyle::parse("^0.4.0").expect("parse style")),
+            ),
+            None,
+        );
+    }
+
+    #[test]
     fn update_policy_inserts_default_style_when_missing() {
         let context = InternalDependencyContext {
             owner: DependencyOwner::UnknownMember,
+            source: DependencySource::Path,
             dependency_publication: Publication::Publishable,
             all_members_private: false,
         };
@@ -262,6 +315,23 @@ mod tests {
         assert_eq!(
             next.render(&Version::parse("0.5.1").expect("valid semver")),
             "0.5.1"
+        );
+    }
+
+    #[test]
+    fn update_policy_preserves_workspace_inherited_dependencies_without_version_fields() {
+        let context = InternalDependencyContext {
+            owner: DependencyOwner::Member {
+                publication: Publication::Publishable,
+            },
+            source: DependencySource::Workspace,
+            dependency_publication: Publication::Publishable,
+            all_members_private: false,
+        };
+
+        assert_eq!(
+            desired_requirement_style(InternalDependencyPolicy::Update, context, None),
+            None,
         );
     }
 
@@ -286,6 +356,28 @@ mod tests {
                 .render(&version),
             "=0.5.1"
         );
+    }
+
+    #[test]
+    fn requirement_style_supports_all_simple_operators() {
+        let version = Version::parse("0.5.1").expect("valid semver");
+        let cases = [
+            ("~0.4", "~0.5"),
+            (">=0.4.0", ">=0.5.1"),
+            ("<=0.4", "<=0.5"),
+            (">0.4.0", ">0.5.1"),
+            ("<0.4.0", "<0.5.1"),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(
+                RequirementStyle::parse(input)
+                    .expect("parse style")
+                    .render(&version),
+                expected,
+                "input {input}",
+            );
+        }
     }
 
     #[test]

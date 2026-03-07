@@ -2,8 +2,8 @@ use crate::git::{CliCommitHistoryService, CommitHistoryService};
 use anyhow::{Context, Result, bail};
 pub use release_kthx_domain::{CommitKind, ReleasePlan};
 use release_kthx_domain::{
-    DependencyOwner, InternalDependencyContext, InternalDependencyPolicy, Publication,
-    RequirementStyle, WorkspaceCrate, WorkspaceGraph, desired_requirement_style,
+    DependencyOwner, DependencySource, InternalDependencyContext, InternalDependencyPolicy,
+    Publication, RequirementStyle, WorkspaceCrate, WorkspaceGraph, desired_requirement_style,
 };
 use semver::Version;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -438,9 +438,9 @@ fn rewrite_dependency_table(
         let Some(dependency_crate) = crates_by_name.get(&dependency_name).copied() else {
             continue;
         };
-        if !dependency_declares_internal_source(dependency_table) {
+        let Some(source) = dependency_source(dependency_table) else {
             continue;
-        }
+        };
 
         let desired_version = desired_versions
             .get(&dependency_name)
@@ -464,6 +464,7 @@ fn rewrite_dependency_table(
             policy,
             InternalDependencyContext {
                 owner: dependency_owner(scope),
+                source,
                 dependency_publication: publication(dependency_crate),
                 all_members_private: all_private,
             },
@@ -488,9 +489,14 @@ fn rewrite_dependency_table(
     Ok(())
 }
 
-fn dependency_declares_internal_source(table: &dyn TableLike) -> bool {
-    table.contains_key("path")
-        || matches!(table.get("workspace").and_then(Item::as_bool), Some(true))
+fn dependency_source(table: &dyn TableLike) -> Option<DependencySource> {
+    if table.contains_key("path") {
+        Some(DependencySource::Path)
+    } else if matches!(table.get("workspace").and_then(Item::as_bool), Some(true)) {
+        Some(DependencySource::Workspace)
+    } else {
+        None
+    }
 }
 
 fn dependency_owner(scope: DependencyRewriteScope<'_>) -> DependencyOwner {
@@ -1060,5 +1066,204 @@ mod tests {
         let drifts = internal_dependency_drifts(root, InternalDependencyPolicy::Auto)
             .expect("detect drifts");
         assert!(drifts.is_empty());
+    }
+
+    #[test]
+    fn strip_policy_removes_versions_for_publishable_internal_edges() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/app\", \"crates/domain\"]\n",
+        )
+        .expect("write workspace manifest");
+        write_crate(root, "crates/domain", "domain", "0.4.0", false, "");
+        write_crate(
+            root,
+            "crates/app",
+            "app",
+            "0.1.0",
+            false,
+            "[dependencies]\ndomain = { path = \"../domain\", version = \"^0.4.0\" }\n",
+        );
+
+        let changed =
+            set_internal_dependency_requirements(root, InternalDependencyPolicy::Strip, &[])
+                .expect("rewrite internal deps");
+        assert_eq!(changed, vec![PathBuf::from("crates/app/Cargo.toml")]);
+
+        let updated = fs::read_to_string(root.join("crates/app/Cargo.toml")).expect("read app");
+        assert!(updated.contains("path = \"../domain\""));
+        assert!(!updated.contains("^0.4.0"));
+    }
+
+    #[test]
+    fn update_policy_inserts_missing_versions_for_internal_edges() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/app\", \"crates/domain\"]\n",
+        )
+        .expect("write workspace manifest");
+        write_crate(root, "crates/domain", "domain", "0.4.0", false, "");
+        write_crate(
+            root,
+            "crates/app",
+            "app",
+            "0.1.0",
+            false,
+            "[dependencies]\ndomain = { path = \"../domain\" }\n",
+        );
+
+        let changed = set_internal_dependency_requirements(
+            root,
+            InternalDependencyPolicy::Update,
+            &[test_plan("domain", "0.4.0", "0.5.0")],
+        )
+        .expect("rewrite internal deps");
+        assert_eq!(changed, vec![PathBuf::from("crates/app/Cargo.toml")]);
+
+        let updated = fs::read_to_string(root.join("crates/app/Cargo.toml")).expect("read app");
+        assert!(updated.contains("path = \"../domain\""));
+        assert!(updated.contains("version = \"0.5.0\""));
+    }
+
+    #[test]
+    fn update_policy_rewrites_renamed_and_target_specific_dependency_sections() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/app\", \"crates/domain\", \"crates/helper\"]\n",
+        )
+        .expect("write workspace manifest");
+        write_crate(root, "crates/domain", "domain", "0.4.0", false, "");
+        write_crate(root, "crates/helper", "helper", "0.2.0", false, "");
+        write_crate(
+            root,
+            "crates/app",
+            "app",
+            "0.1.0",
+            false,
+            r#"[dependencies]
+domain-api = { package = "domain", path = "../domain", version = "^0.4.0" }
+
+[dev-dependencies]
+helper = { path = "../helper", version = "0.2.0" }
+
+[build-dependencies]
+helper-build = { package = "helper", path = "../helper", version = "0.2.0" }
+
+[target.'cfg(unix)'.dependencies]
+domain-unix = { package = "domain", path = "../domain", version = "^0.4.0" }
+
+[target.'cfg(unix)'.dev-dependencies]
+helper = { path = "../helper", version = "0.2.0" }
+
+[target.'cfg(unix)'.build-dependencies]
+helper-build = { package = "helper", path = "../helper", version = "0.2.0" }
+"#,
+        );
+
+        let changed = set_internal_dependency_requirements(
+            root,
+            InternalDependencyPolicy::Update,
+            &[
+                test_plan("domain", "0.4.0", "0.5.0"),
+                test_plan("helper", "0.2.0", "0.3.0"),
+            ],
+        )
+        .expect("rewrite internal deps");
+        assert_eq!(changed, vec![PathBuf::from("crates/app/Cargo.toml")]);
+
+        let updated = fs::read_to_string(root.join("crates/app/Cargo.toml")).expect("read app");
+        assert_eq!(updated.matches("version = \"^0.5.0\"").count(), 2);
+        assert_eq!(updated.matches("version = \"0.3.0\"").count(), 4);
+        assert!(updated.contains(
+            "domain-api = { package = \"domain\", path = \"../domain\", version = \"^0.5.0\" }"
+        ));
+        assert!(updated.contains(
+            "domain-unix = { package = \"domain\", path = \"../domain\", version = \"^0.5.0\" }"
+        ));
+        assert!(updated.contains(
+            "helper-build = { package = \"helper\", path = \"../helper\", version = \"0.3.0\" }"
+        ));
+    }
+
+    #[test]
+    fn update_policy_rewrites_workspace_dependency_versions() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/app\", \"crates/domain\"]\n\n[workspace.dependencies]\ndomain = { path = \"crates/domain\", version = \"^0.4.0\" }\n",
+        )
+        .expect("write workspace manifest");
+        write_crate(root, "crates/domain", "domain", "0.4.0", false, "");
+        write_crate(
+            root,
+            "crates/app",
+            "app",
+            "0.1.0",
+            false,
+            "[dependencies]\ndomain = { workspace = true }\n",
+        );
+
+        let changed = set_internal_dependency_requirements(
+            root,
+            InternalDependencyPolicy::Update,
+            &[test_plan("domain", "0.4.0", "0.5.0")],
+        )
+        .expect("rewrite workspace dependencies");
+        assert_eq!(changed, vec![PathBuf::from("Cargo.toml")]);
+
+        let updated = fs::read_to_string(root.join("Cargo.toml")).expect("read root manifest");
+        assert!(updated.contains("domain = { path = \"crates/domain\", version = \"^0.5.0\" }"));
+
+        let app_manifest =
+            fs::read_to_string(root.join("crates/app/Cargo.toml")).expect("read app manifest");
+        assert!(app_manifest.contains("domain = { workspace = true }"));
+        assert!(!app_manifest.contains("0.5.0"));
+    }
+
+    #[test]
+    fn unsupported_internal_dependency_requirements_fail_rewrite() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/app\", \"crates/domain\"]\n",
+        )
+        .expect("write workspace manifest");
+        write_crate(root, "crates/domain", "domain", "0.4.0", false, "");
+        write_crate(
+            root,
+            "crates/app",
+            "app",
+            "0.1.0",
+            false,
+            "[dependencies]\ndomain = { path = \"../domain\", version = \">=0.4.0, <0.5.0\" }\n",
+        );
+
+        let error = set_internal_dependency_requirements(
+            root,
+            InternalDependencyPolicy::Update,
+            &[test_plan("domain", "0.4.0", "0.5.0")],
+        )
+        .expect_err("rewrite should fail");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains(
+            "failed parsing internal dependency requirement for domain in crates/app/Cargo.toml"
+        ));
+        assert!(
+            rendered
+                .contains("unsupported internal dependency version requirement `>=0.4.0, <0.5.0`")
+        );
     }
 }

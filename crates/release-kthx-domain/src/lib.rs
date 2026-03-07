@@ -6,8 +6,8 @@ mod versioning;
 
 pub use commit::{CommitInput, CommitKind, PlannedCommit};
 pub use internal_dependencies::{
-    DependencyOwner, InternalDependencyContext, InternalDependencyPolicy, Publication,
-    RequirementStyle, RequirementStyleParseError, desired_requirement_style,
+    DependencyOwner, DependencySource, InternalDependencyContext, InternalDependencyPolicy,
+    Publication, RequirementStyle, RequirementStyleParseError, desired_requirement_style,
 };
 pub use release_plan::ReleasePlan;
 pub use topology::{ReleaseTopology, WorkspaceCrate, WorkspaceGraph};
