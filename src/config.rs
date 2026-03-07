@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use release_kthx_domain::InternalDependencyPolicy;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -9,20 +10,6 @@ pub struct ReleaseKthxConfig {
     pub release: ReleaseConfig,
     #[serde(default)]
     pub github: GithubConfig,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum InternalDependencyPolicy {
-    Auto,
-    Strip,
-    Update,
-}
-
-impl Default for InternalDependencyPolicy {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

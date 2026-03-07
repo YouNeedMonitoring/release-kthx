@@ -147,7 +147,7 @@ fn run_release_pr(
     let mut changed_manifests = release::set_crate_versions(&path, &plans)?;
     changed_manifests.extend(release::set_internal_dependency_requirements(
         &path,
-        cfg.release.internal_dependency_policy.clone(),
+        cfg.release.internal_dependency_policy,
         &plans,
     )?);
     if release::set_lockfile_versions(&path, &plans)? {

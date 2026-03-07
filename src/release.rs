@@ -1,9 +1,11 @@
-use crate::config::InternalDependencyPolicy;
 use crate::git::{CliCommitHistoryService, CommitHistoryService};
 use anyhow::{Context, Result, bail};
 pub use release_kthx_domain::{CommitKind, ReleasePlan};
-use release_kthx_domain::{WorkspaceCrate, WorkspaceGraph};
-use semver::{Version, VersionReq};
+use release_kthx_domain::{
+    DependencyOwner, InternalDependencyContext, InternalDependencyPolicy, Publication,
+    RequirementStyle, WorkspaceCrate, WorkspaceGraph, desired_requirement_style,
+};
+use semver::Version;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -261,13 +263,6 @@ enum DependencyRewriteScope<'a> {
     WorkspaceDependencies,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum VersionPrecision {
-    Major,
-    Minor,
-    Patch,
-}
-
 fn desired_versions_by_crate(
     crates: &[CrateInfo],
     plans: &[CrateReleasePlan],
@@ -447,20 +442,34 @@ fn rewrite_dependency_table(
             continue;
         }
 
+        let desired_version = desired_versions
+            .get(&dependency_name)
+            .with_context(|| format!("missing desired version for {dependency_name}"))?;
         let current_requirement = dependency_table
             .get("version")
             .and_then(Item::as_str)
             .map(str::to_string);
-        let next_requirement = desired_internal_dependency_requirement(
+        let current_style = current_requirement
+            .as_deref()
+            .map(RequirementStyle::parse)
+            .transpose()
+            .with_context(|| {
+                format!(
+                    "failed parsing internal dependency requirement for {} in {}",
+                    dependency_name,
+                    manifest_path.display()
+                )
+            })?;
+        let next_requirement = desired_requirement_style(
             policy,
-            scope,
-            dependency_crate,
-            all_private,
-            current_requirement.as_deref(),
-            desired_versions
-                .get(&dependency_name)
-                .with_context(|| format!("missing desired version for {dependency_name}"))?,
-        )?;
+            InternalDependencyContext {
+                owner: dependency_owner(scope),
+                dependency_publication: publication(dependency_crate),
+                all_members_private: all_private,
+            },
+            current_style,
+        )
+        .map(|style| style.render(desired_version));
 
         if current_requirement == next_requirement {
             continue;
@@ -484,33 +493,20 @@ fn dependency_declares_internal_source(table: &dyn TableLike) -> bool {
         || matches!(table.get("workspace").and_then(Item::as_bool), Some(true))
 }
 
-fn desired_internal_dependency_requirement(
-    policy: InternalDependencyPolicy,
-    scope: DependencyRewriteScope<'_>,
-    dependency_crate: &CrateInfo,
-    all_private: bool,
-    current_requirement: Option<&str>,
-    next_version: &Version,
-) -> Result<Option<String>> {
-    let should_strip = match scope {
+fn dependency_owner(scope: DependencyRewriteScope<'_>) -> DependencyOwner {
+    match scope {
         DependencyRewriteScope::Member {
             dependent: Some(dependent),
-        } => dependent.private && dependency_crate.private,
-        DependencyRewriteScope::WorkspaceDependencies => all_private && dependency_crate.private,
-        DependencyRewriteScope::Member { dependent: None } => false,
-    };
-
-    match policy {
-        InternalDependencyPolicy::Strip => Ok(None),
-        InternalDependencyPolicy::Update => Ok(Some(upgrade_dependency_requirement(
-            current_requirement,
-            next_version,
-        )?)),
-        InternalDependencyPolicy::Auto if should_strip => Ok(None),
-        InternalDependencyPolicy::Auto => current_requirement
-            .map(|requirement| upgrade_dependency_requirement(Some(requirement), next_version))
-            .transpose(),
+        } => DependencyOwner::Member {
+            publication: publication(dependent),
+        },
+        DependencyRewriteScope::Member { dependent: None } => DependencyOwner::UnknownMember,
+        DependencyRewriteScope::WorkspaceDependencies => DependencyOwner::Workspace,
     }
+}
+
+fn publication(crate_info: &CrateInfo) -> Publication {
+    Publication::from_private(crate_info.private)
 }
 
 fn apply_dependency_requirement(table: &mut dyn TableLike, requirement: Option<String>) {
@@ -521,56 +517,6 @@ fn apply_dependency_requirement(table: &mut dyn TableLike, requirement: Option<S
         None => {
             table.remove("version");
         }
-    }
-}
-
-fn upgrade_dependency_requirement(
-    current_requirement: Option<&str>,
-    next_version: &Version,
-) -> Result<String> {
-    let Some(current_requirement) = current_requirement.map(str::trim) else {
-        return Ok(next_version.to_string());
-    };
-    if current_requirement.is_empty() {
-        return Ok(next_version.to_string());
-    }
-
-    let parsed = VersionReq::parse(current_requirement).with_context(|| {
-        format!("unsupported internal dependency version requirement `{current_requirement}`")
-    })?;
-    if parsed.comparators.len() != 1 {
-        bail!("unsupported internal dependency version requirement `{current_requirement}`");
-    }
-
-    let comparator = &parsed.comparators[0];
-    let precision = if comparator.patch.is_some() {
-        VersionPrecision::Patch
-    } else if comparator.minor.is_some() {
-        VersionPrecision::Minor
-    } else {
-        VersionPrecision::Major
-    };
-
-    let prefix = requirement_prefix(current_requirement).unwrap_or_default();
-    Ok(format!(
-        "{}{}",
-        prefix,
-        format_version_with_precision(next_version, precision)
-    ))
-}
-
-fn requirement_prefix(requirement: &str) -> Option<&'static str> {
-    let trimmed = requirement.trim();
-    [">=", "<=", "^", "~", "=", ">", "<"]
-        .into_iter()
-        .find(|prefix| trimmed.starts_with(prefix))
-}
-
-fn format_version_with_precision(version: &Version, precision: VersionPrecision) -> String {
-    match precision {
-        VersionPrecision::Major => version.major.to_string(),
-        VersionPrecision::Minor => format!("{}.{}", version.major, version.minor),
-        VersionPrecision::Patch => version.to_string(),
     }
 }
 
@@ -985,23 +931,6 @@ mod tests {
             .find(|crate_info| crate_info.name == "domain")
             .expect("domain crate");
         assert!(domain.local_dependencies.is_empty());
-    }
-
-    #[test]
-    fn upgrade_dependency_requirement_preserves_style() {
-        let next = Version::parse("0.5.1").expect("valid semver");
-        assert_eq!(
-            upgrade_dependency_requirement(Some("0.4.0"), &next).expect("upgrade"),
-            "0.5.1"
-        );
-        assert_eq!(
-            upgrade_dependency_requirement(Some("^0.4"), &next).expect("upgrade"),
-            "^0.5"
-        );
-        assert_eq!(
-            upgrade_dependency_requirement(Some("=0.4.0"), &next).expect("upgrade"),
-            "=0.5.1"
-        );
     }
 
     #[test]
