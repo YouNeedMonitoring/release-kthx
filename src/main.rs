@@ -268,6 +268,8 @@ fn run_release(path: PathBuf, from_tag: Option<String>, dry_run: bool, push: boo
         return Ok(());
     }
 
+    git::ensure_identity(&path)?;
+
     for (crate_plan, tag_name) in &targets {
         git::create_annotated_tag(
             &path,
@@ -334,6 +336,8 @@ fn run_publish(path: PathBuf, dry_run: bool, push: bool) -> Result<()> {
         println!("dry-run enabled, no tag or github release created");
         return Ok(());
     }
+
+    git::ensure_identity(&path)?;
 
     for (crate_info, tag_name) in &pending {
         git::create_annotated_tag(
