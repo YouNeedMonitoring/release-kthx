@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-mode="${INPUT_MODE:-plan}"
-path="${INPUT_PATH:-.}"
-from_tag="${INPUT_FROM_TAG:-}"
-base_branch="${INPUT_BASE_BRANCH:-main}"
-pr_branch="${INPUT_PR_BRANCH:-release-kthx/release-pr}"
-dry_run="${INPUT_DRY_RUN:-true}"
-push="${INPUT_PUSH:-false}"
-force="${INPUT_FORCE:-false}"
+# GitHub Actions preserves hyphens in INPUT_ env vars (INPUT_DRY-RUN, not
+# INPUT_DRY_RUN). Hyphens are invalid in POSIX variable names, so we must
+# use printenv to read them.
+mode="$(printenv 'INPUT_MODE' 2>/dev/null || echo "plan")"
+path="$(printenv 'INPUT_PATH' 2>/dev/null || echo ".")"
+from_tag="$(printenv 'INPUT_FROM-TAG' 2>/dev/null || echo "")"
+base_branch="$(printenv 'INPUT_BASE-BRANCH' 2>/dev/null || echo "main")"
+pr_branch="$(printenv 'INPUT_PR-BRANCH' 2>/dev/null || echo "release-kthx/release-pr")"
+dry_run="$(printenv 'INPUT_DRY-RUN' 2>/dev/null || echo "true")"
+push="$(printenv 'INPUT_PUSH' 2>/dev/null || echo "false")"
+force="$(printenv 'INPUT_FORCE' 2>/dev/null || echo "false")"
 
 configure_safe_directory() {
   local repo_path="$1"
